@@ -1,6 +1,7 @@
 /*
-  DHT22 + ёмкостный датчик почвы + помпа на реле + RTC DS3231 + LCD 16x2 + энкодер
-  --------------------------------------------------------------------------------
+  ESP32: DHT22 + ёмкостный датчик почвы + помпа на реле + RTC DS3231
+         + LCD 16x2 (I2C) + энкодер + веб-сервер
+
   Экранов три, переключаются энкодером по кругу
   (вправо — следующий, влево — предыдущий):
 
@@ -8,23 +9,23 @@
    2) SOIL  — влажность почвы, опрос раз в 10 с
    3) CLOCK — время и дата с DS3231
 
+  Web:
+   * http://<ip-адрес>        — страница с показаниями (обновление раз в 2 с)
+   * http://<ip-адрес>/api    — те же данные в JSON
+   * http://dht22.local       — то же самое по mDNS (если сеть умеет)
+   * сервер только читает данные, ничего не переключает и не поливает.
+
   Полив:
    * влажность <= 20 %  → реле включает помпу (пин 27);
-   * влажность >= 30 %  → реле выключает помпу (гистерезис, чтобы не
-     «дребезжать» контактами на границе 20 %);
-   * помпа не выключается раньше PUMP_MIN_ON_MS — защита реле от частых
-     срабатываний;
-   * защита по времени: не дольше PUMP_MAX_MS подряд, затем пауза
-     PUMP_COOLDOWN_MS;
+   * влажность >= 30 %  → реле выключает помпу (гистерезис);
+   * помпа не выключается раньше PUMP_MIN_ON_MS — защита реле;
+   * не дольше PUMP_MAX_MS подряд, затем пауза PUMP_COOLDOWN_MS;
    * обрыв/КЗ датчика почвы — полив блокируется;
-   * почва опрашивается всегда, даже когда на экране время или воздух;
-   * при старте помпа гарантированно выключена.
+   * почва опрашивается всегда, при старте помпа выключена.
 
   Часы:
-   * DS3231 висит на той же шине I2C (SDA 21, SCL 22), адрес 0x68;
-   * если при старте RTC сообщает о потере питания (села батарейка CR2032),
-     время выставляется по времени компиляции скетча — потом поправьте
-     кнопкой/через NTP (см. комментарий в setup).
+   * DS3231 на шине I2C (SDA 21, SCL 22), адрес 0x68 (LCD — 0x27);
+   * при потере питания время ставится по времени компиляции.
 
   ВАЖНО: пороги SOIL_DRY_MV / SOIL_WET_MV — в милливольтах и зависят от
   экземпляра датчика. Как откалибровать — в комментарии под ними.
@@ -37,8 +38,9 @@
    * lcd.clear() в цикле убран: пишется только изменившаяся строка ровно
      на 16 символов — нет мерцания и «хвостов» от старых значений.
    * Пока данные не обновились, шина I2C не используется вообще.
-   * Часы читаются 4 раза в секунду, но экран перерисовывается только при
-     смене секунды.
+   * WiFi подключается неблокирующе: loop() и энкодер работают во время
+     соединения, при обрыве — повтор каждые 15 с.
+   * Часы читаются 4 раза в секунду, LCD перерисовывается по смене секунды.
    * Ошибка чтения DHT22 — повтор через 2 с, а не через 5 минут.
    * Нет delay(2000) в setup() — прогрев датчика не блокирует энкодер.
    * Время в uint32_t, сравнение разностей — переполнение millis() не страшно.
@@ -49,6 +51,20 @@
 #include <DHT.h>
 #include <EncButton.h>
 #include <RTClib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+// ---------------- WiFi ----------------
+// Логин и пароль — в secrets.h (он в .gitignore, на GitHub не попадает).
+// Перед сборкой: скопируйте secrets.example.h в secrets.h и впишите свои данные.
+// ESP32 работает только с сетями 2.4 ГГц.
+#include "secrets.h"
+
+constexpr char MDNS_NAME[] = "dht22";          // http://dht22.local
+
+constexpr uint32_t WIFI_RETRY_MS  = 15000;     // пауза между попытками подключения
+constexpr uint32_t WIFI_SCREEN_MS = 3000;      // сколько показывать IP на LCD
 
 // ---------------- Настройки ----------------
 constexpr uint8_t DHT_PIN  = 4;
@@ -96,11 +112,11 @@ constexpr uint32_t PUMP_MIN_ON_MS   = 5UL * 1000UL;    // минимум раб�
 constexpr uint32_t PUMP_MAX_MS      = 30UL * 1000UL;   // максимум непрерывной работы
 constexpr uint32_t PUMP_COOLDOWN_MS = 60UL * 1000UL;   // пауза после аварии
 
-constexpr uint32_t INTERVAL_AIR   = 5UL * 60UL * 1000UL;  // воздух — 5 минут
-constexpr uint32_t INTERVAL_SOIL  = 10UL * 1000UL;        // почва — 10 секунд
-constexpr uint32_t CLOCK_REFRESH  = 250;                  // опрос DS3231
-constexpr uint32_t RETRY_MS       = 2000;                 // повтор после ошибки DHT22
-constexpr uint32_t WARMUP_MS      = 2000;                 // прогрев DHT22 после старта
+constexpr uint32_t INTERVAL_AIR  = 5UL * 60UL * 1000UL;   // воздух — 5 минут
+constexpr uint32_t INTERVAL_SOIL = 10UL * 1000UL;         // почва — 10 секунд
+constexpr uint32_t CLOCK_REFRESH = 250;                   // опрос DS3231
+constexpr uint32_t RETRY_MS      = 2000;                  // повтор после ошибки DHT22
+constexpr uint32_t WARMUP_MS     = 2000;                  // прогрев DHT22 после старта
 
 constexpr char DEGREE = '\xDF';                // знак градуса в HD44780
 
@@ -109,6 +125,7 @@ EncButton enc(ENC_CLK, ENC_DT, ENC_SW);
 LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);
 DHT dht(DHT_PIN, DHT_TYPE);
 RTC_DS3231 rtc;
+WebServer server(80);
 
 enum class View : uint8_t { AIR, SOIL, CLOCK };
 constexpr uint8_t VIEW_COUNT = 3;
@@ -117,13 +134,22 @@ constexpr const char* const WEEKDAYS[7] = {
   "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
 
+// Дата и время в виде строк — общие для экрана и для /api.
+// Объявлено до первой функции: Arduino вставляет сюда же автопрототипы.
+struct ClockText {
+  char        time[9];      // "14:35:07"
+  char        date[11];     // "27.10.2026"
+  const char* wd;           // "Tue"
+};
+
 // ---------------- Состояние ----------------
 View     view = View::AIR;
 char     screen[LCD_ROWS][LCD_COLS + 1];       // то, что уже на экране
 
-uint32_t nextAir   = 0;
-uint32_t nextSoil  = 0;
-uint32_t nextClock = 0;
+uint32_t nextAir     = 0;
+uint32_t nextSoil    = 0;
+uint32_t nextClock   = 0;
+uint32_t nextWifiTry = 0;
 uint32_t pumpStartedAt = 0;
 uint32_t pumpLockUntil = 0;
 
@@ -138,6 +164,8 @@ bool soilOk      = false;
 bool rtcOk       = false;
 bool clockOk     = false;
 bool pumpOn      = false;
+bool netUp       = false;
+bool mdnsStarted = false;
 bool screenDirty = false;
 
 // ---------------- Помпа ----------------
@@ -192,6 +220,22 @@ void drawRow(uint8_t row, const char* text) {
   lcd.print(buf);
 }
 
+// ---------------- Часы ----------------
+void clockText(ClockText& out) {
+  if (!clockOk) {
+    strcpy(out.time, "--:--:--");
+    strcpy(out.date, "--.--.----");
+    out.wd = "---";
+    return;
+  }
+
+  snprintf(out.time, sizeof(out.time), "%02d:%02d:%02d",
+           clockNow.hour(), clockNow.minute(), clockNow.second());
+  snprintf(out.date, sizeof(out.date), "%02d.%02d.%04d",
+           clockNow.day(), clockNow.month(), clockNow.year());
+  out.wd = WEEKDAYS[clockNow.dayOfTheWeek()];
+}
+
 void render() {
   char row0[LCD_COLS + 1];
   char row1[LCD_COLS + 1];
@@ -205,17 +249,17 @@ void render() {
       snprintf(row1, sizeof(row1), "%4u mV %-4s", soilMv, pumpOn ? "PUMP" : "");
       break;
 
-    case View::CLOCK:
+    case View::CLOCK: {
+      ClockText ct;
+      clockText(ct);
       if (!clockOk) {
         snprintf(row0, sizeof(row0), "RTC not found");
       } else {
-        snprintf(row0, sizeof(row0), "Time: %02d:%02d:%02d",
-                 clockNow.hour(), clockNow.minute(), clockNow.second());
-        snprintf(row1, sizeof(row1), "%02d.%02d.%04d %s",
-                 clockNow.day(), clockNow.month(), clockNow.year(),
-                 WEEKDAYS[clockNow.dayOfTheWeek()]);
+        snprintf(row0, sizeof(row0), "Time: %s", ct.time);
+        snprintf(row1, sizeof(row1), "%s %s", ct.date, ct.wd);
       }
       break;
+    }
 
     case View::AIR:
     default:
@@ -296,7 +340,7 @@ bool readAir() {
   return true;
 }
 
-// ---------------- Часы ----------------
+// ---------------- Часы (опрос) ----------------
 void readClock() {
   if (!rtcOk) {
     clockOk = false;
@@ -307,9 +351,130 @@ void readClock() {
 
   if (clockOk && t.unixtime() == clockNow.unixtime()) return;  // секунда не сменилась
 
-  clockNow    = t;
-  clockOk     = true;
-  screenDirty = true;
+  clockNow = t;
+  clockOk  = true;
+
+  // Экран перерисовываем только если он сейчас показан.
+  if (view == View::CLOCK) screenDirty = true;
+}
+
+// ---------------- WiFi ----------------
+void serviceWiFi(uint32_t now) {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!netUp) {
+      netUp = true;
+      Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+
+      if (!mdnsStarted) {
+        mdnsStarted = MDNS.begin(MDNS_NAME);
+        if (mdnsStarted) {
+          MDNS.addService("http", "tcp", 80);
+          Serial.printf("mDNS: http://%s.local\n", MDNS_NAME);
+        }
+      }
+
+      // Показать IP на экране на WIFI_SCREEN_MS — без delay():
+      // просто откладываем первый замер почвы, который перерисует экран.
+      drawRow(0, "WiFi OK");
+      drawRow(1, WiFi.localIP().toString().c_str());
+      nextSoil = now + WIFI_SCREEN_MS;
+    }
+    return;
+  }
+
+  if (netUp) {
+    netUp = false;
+    Serial.println("WiFi: connection lost");
+  }
+
+  if ((int32_t)(now - nextWifiTry) < 0) return;
+  nextWifiTry = now + WIFI_RETRY_MS;
+
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.println("WiFi: connecting...");
+}
+
+// ---------------- Web ----------------
+const char INDEX_HTML[] PROGMEM = R"html(<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 · датчики</title>
+<style>
+:root{--bg:#0f1419;--card:#1a2129;--fg:#e6edf3;--dim:#8b98a5;--ok:#3fb950;--bad:#f85149}
+*{box-sizing:border-box}
+body{margin:0;padding:20px;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,"Segoe UI",Arial,sans-serif}
+h1{margin:0 0 16px;font-size:17px;font-weight:600;color:var(--dim)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;max-width:760px}
+.card{background:var(--card);border-radius:12px;padding:14px 16px}
+.k{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}
+.v{margin-top:4px;font-size:30px;font-weight:600;line-height:1.15}
+.v small{font-size:15px;font-weight:400;color:var(--dim)}
+.on{color:var(--ok)}.off{color:var(--dim)}.err{color:var(--bad)}
+footer{margin-top:16px;color:var(--dim);font-size:13px}
+</style></head><body>
+<h1>ESP32 · датчики и климат</h1>
+<div class="grid">
+<div class="card"><div class="k">Температура</div><div class="v" id="t">—</div></div>
+<div class="card"><div class="k">Влажность воздуха</div><div class="v" id="h">—</div></div>
+<div class="card"><div class="k">Влажность почвы</div><div class="v" id="s">—</div></div>
+<div class="card"><div class="k">Помпа</div><div class="v" id="p">—</div></div>
+<div class="card"><div class="k">Время</div><div class="v" id="tm">—</div></div>
+<div class="card"><div class="k">Дата</div><div class="v" id="dt">—</div></div>
+</div>
+<footer id="st">подключение…</footer>
+<script>
+const $ = id => document.getElementById(id);
+const fmtUp = s => s < 3600 ? Math.floor(s / 60) + " мин"
+                            : Math.floor(s / 3600) + " ч " + Math.floor(s % 3600 / 60) + " мин";
+async function tick() {
+  try {
+    const r = await fetch("/api", { cache: "no-store" });
+    const d = await r.json();
+    $("t").innerHTML = d.t_ok ? d.t.toFixed(1) + "<small> °C</small>" : '<span class="err">ошибка</span>';
+    $("h").innerHTML = d.t_ok ? d.h.toFixed(1) + "<small> %</small>" : '<span class="err">ошибка</span>';
+    $("s").innerHTML = d.soil_ok
+      ? d.soil + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" + d.mv + " мВ</div>"
+      : '<span class="err">датчик</span>';
+    $("p").innerHTML = d.pump ? '<span class="on">ВКЛ</span>' : '<span class="off">выкл</span>';
+    $("tm").textContent = d.time;
+    $("dt").textContent = d.date + " " + d.wd;
+    $("st").textContent = "IP " + d.ip + " · RSSI " + d.rssi + " dBm · работает " + fmtUp(d.up);
+  } catch (e) {
+    $("st").textContent = "нет связи с ESP32";
+  }
+}
+tick(); setInterval(tick, 2000);
+</script></body></html>)html";
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleApi() {
+  ClockText ct;
+  clockText(ct);
+
+  char json[256];
+  snprintf(json, sizeof(json),
+           "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
+           "\"soil_ok\":%s,\"pump\":%s,\"time\":\"%s\",\"date\":\"%s\","
+           "\"wd\":\"%s\",\"up\":%lu,\"rssi\":%d,\"ip\":\"%s\"}",
+           airOk ? temperature : 0.0f,
+           airOk ? "true" : "false",
+           airOk ? humidity : 0.0f,
+           soilOk ? soilPercent : 0,
+           (unsigned)soilMv,
+           soilOk ? "true" : "false",
+           pumpOn ? "true" : "false",
+           ct.time, ct.date, ct.wd,
+           (unsigned long)(millis() / 1000UL),
+           WiFi.RSSI(),
+           WiFi.localIP().toString().c_str());
+
+  server.sendHeader("Cache-Control", "no-store, max-age=0");
+  server.send(200, "application/json", json);
 }
 
 // ---------------- Экраны ----------------
@@ -358,11 +523,23 @@ void setup() {
     Serial.println("DS3231 not found (check SDA/SCL, 3.3V, address 0x68)");
   } else if (rtc.lostPower()) {
     // Батарейка села / часы не ходили — ставим время компиляции.
-    // Вместо этого можно один раз выставить точное время вручную:
-    //   rtc.adjust(DateTime(2026, 10, 21, 14, 30, 0));
+    // Точное время можно выставить один раз так:
+    //   rtc.adjust(DateTime(2026, 10, 27, 14, 30, 0));
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     Serial.println("DS3231: time lost, set to build time");
   }
+
+  // WiFi: подключение неблокирующее, дальше им занимается serviceWiFi().
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // меньше задержки и помех АЦП (чуть больше ток)
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  nextWifiTry = millis() + WIFI_RETRY_MS;
+
+  server.on("/", handleRoot);
+  server.on("/api", handleApi);
+  server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
+  server.begin();
 
   nextAir   = millis() + WARMUP_MS;   // вместо delay(2000) — не блокируем loop()
   nextSoil  = millis();
@@ -384,6 +561,9 @@ void loop() {
 
   const uint32_t now = millis();
 
+  serviceWiFi(now);
+  server.handleClient();
+
   // Почва опрашивается в любом режиме: от неё зависит полив.
   if ((int32_t)(now - nextSoil) >= 0) {
     nextSoil = now + INTERVAL_SOIL;
@@ -394,7 +574,8 @@ void loop() {
     nextAir = now + (readAir() ? INTERVAL_AIR : RETRY_MS);
   }
 
-  if (view == View::CLOCK && (int32_t)(now - nextClock) >= 0) {
+  // Часы читаем всегда — они нужны и на экране, и в /api.
+  if ((int32_t)(now - nextClock) >= 0) {
     nextClock = now + CLOCK_REFRESH;
     readClock();
   }

@@ -1,0 +1,13 @@
+# Локальные секреты: Wi-Fi логин/пароль
+secrets.h
+
+# Артефакты сборки Arduino / PlatformIO
+build/
+.pio/
+*.bin
+*.elf
+*.map
+
+# ОС
+Thumbs.db
+.DS_Store
