@@ -19,18 +19,22 @@
    * POST /pump (state=on|off|auto) — ручное управление помпой;
      запрос защищён одноразовым токеном, страница получает его из /api.
 
-  Полив:
-   * влажность <= 20 %  → реле включает помпу (пин 27);
-   * влажность >= 30 %  → реле выключает помпу (гистерезис);
-   * помпа не выключается раньше PUMP_MIN_ON_MS — защита реле;
-   * не дольше PUMP_MAX_MS подряд, затем пауза PUMP_COOLDOWN_MS;
+  Полив (циклами, порциями):
+   * влажность <= 20 % (SOIL_START_PCT) → начинаем сессию полива;
+   * цикл: помпа 15 с (WATER_ON_MS), затем пауза 20 с (WATER_PAUSE_MS);
+   * в паузе делаются 3 замера, берётся медиана: если она ниже 70 %
+     (SOIL_TARGET_PCT) — ещё один цикл, и так до цели;
+   * предохранители: не больше WATER_MAX_CYCLES (12) циклов = 3 мин воды
+     на сессию, затем 10 минут паузы; после успеха — минута на впитывание;
+   * помпа никогда не работает дольше PUMP_MAX_MS подряд (страховка);
    * обрыв/КЗ датчика почвы — полив блокируется;
    * одиночный выброс АЦП выключает помпу, но не даёт паузу 60 с —
      только серия из SOIL_FAULT_LOCK_AFTER ошибок подряд;
    * почва опрашивается всегда, при старте помпа выключена:
      уровень реле задаётся до pinMode(), иначе core 3.x его игнорирует;
    * ручной режим из web: ВКЛ — максимум MANUAL_ON_MS (датчик игнорируется),
-     ВЫКЛ — автоматика на паузе MANUAL_OFF_MS, затем снова AUTO.
+     ВЫКЛ — автоматика на паузе MANUAL_OFF_MS, затем снова AUTO;
+     ручная команда прерывает текущую сессию полива.
 
   Часы:
    * DS3231 на шине I2C (SDA 21, SCL 22), адрес 0x68 (LCD — 0x27);
@@ -120,13 +124,25 @@ constexpr uint8_t SOIL_SAMPLES = 15;
 constexpr uint8_t SOIL_TRIM    = 3;
 
 // Пороги полива, %
-constexpr int SOIL_PUMP_ON_PCT  = 20;          // суше — включаем помпу
-constexpr int SOIL_PUMP_OFF_PCT = 30;          // влажнее — выключаем
+constexpr int SOIL_START_PCT  = 20;   // суше — начинаем сессию полива
+constexpr int SOIL_TARGET_PCT = 70;   // влажность в паузе достигла — сессия окончена
+
+// Полив порциями: 15 с льём, 20 с ждём, пока вода впитается, и за это время
+// делаем несколько замеров. Если медиана замеров всё ещё ниже цели — ещё цикл.
+constexpr uint32_t WATER_ON_MS    = 15UL * 1000UL;   // помпа работает
+constexpr uint32_t WATER_PAUSE_MS = 20UL * 1000UL;   // пауза на впитывание и замеры
+constexpr uint8_t  WATER_MEASURES = 3;               // замеров за паузу (берём медиану)
+constexpr uint32_t WATER_MEASURE_STEP = WATER_PAUSE_MS / (WATER_MEASURES + 1);  // 5 с
+constexpr uint8_t  WATER_MAX_CYCLES = 12;            // предохранитель: 12 × 15 с = 3 мин
+
+// Пауза автоматики после сессии: даём воде разойтись по грунту и не лить
+// снова сразу. После исчерпания циклов пауза гораздо длиннее.
+constexpr uint32_t WATER_SETTLE_MS = 60UL * 1000UL;        // 1 минута после успеха
+constexpr uint32_t WATER_RETRY_MS  = 10UL * 60UL * 1000UL;  // 10 минут после лимита
 
 // Релейный модуль с опторазвязкой — вход активный НИЗКИЙ.
 constexpr uint8_t PUMP_ON_LEVEL = LOW;
 
-constexpr uint32_t PUMP_MIN_ON_MS   = 5UL * 1000UL;    // минимум работы за раз
 constexpr uint32_t PUMP_MAX_MS      = 30UL * 1000UL;   // максимум непрерывной работы
 constexpr uint32_t PUMP_COOLDOWN_MS = 60UL * 1000UL;   // пауза после аварии
 
@@ -161,6 +177,9 @@ constexpr uint8_t VIEW_COUNT = 3;
 
 enum class PumpMode : uint8_t { AUTO, MANUAL_ON, MANUAL_OFF };
 
+// Фаза автоматического полива: льём / ждём и меряем / ждём следующего раза.
+enum class WaterState : uint8_t { IDLE, RUN, PAUSE };
+
 constexpr const char* const WEEKDAYS[7] = {
   "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
@@ -184,8 +203,15 @@ uint32_t nextWifiTry = 0;
 uint32_t pumpStartedAt = 0;
 uint32_t pumpLockUntil = 0;
 uint32_t manualEndsAt  = 0;
+uint32_t waterPauseUntil = 0;
+uint32_t nextMeasureAt   = 0;
 
 PumpMode pumpMode = PumpMode::AUTO;
+
+WaterState waterState    = WaterState::IDLE;
+uint8_t    waterCycle    = 0;                              // циклов в текущей сессии
+uint8_t    waterSampleN  = 0;                              // валидных замеров в паузе
+uint8_t    waterSamplePct[WATER_MEASURES] = {0};
 
 float    temperature = 0;
 float    humidity    = 0;
@@ -226,7 +252,15 @@ uint32_t manualLeftS(uint32_t now) {
   return left > 0 ? (uint32_t)left / 1000UL : 0;
 }
 
+// Сбросить автоматическую сессию полива (ручная команда или авария).
+void waterReset() {
+  waterState   = WaterState::IDLE;
+  waterCycle   = 0;
+  waterSampleN = 0;
+}
+
 void pumpManualOn(uint32_t now) {
+  waterReset();                     // ручная команда прерывает авто-сессию
   pumpMode      = PumpMode::MANUAL_ON;
   manualEndsAt  = now + MANUAL_ON_MS;
   pumpStartedAt = now;
@@ -236,6 +270,7 @@ void pumpManualOn(uint32_t now) {
 }
 
 void pumpManualOff(uint32_t now) {
+  waterReset();
   pumpMode      = PumpMode::MANUAL_OFF;
   manualEndsAt  = now + MANUAL_OFF_MS;
   pumpSet(false);
@@ -245,6 +280,7 @@ void pumpManualOff(uint32_t now) {
 }
 
 void pumpAuto(uint32_t now) {
+  waterReset();
   if (pumpMode == PumpMode::MANUAL_ON) {
     // Ручной полив уже шёл — останавливаем и даём почве впитать воду.
     pumpSet(false);
@@ -257,7 +293,51 @@ void pumpAuto(uint32_t now) {
   Serial.println("Pump: AUTO");
 }
 
-// Вызывается в каждом проходе loop(): и гистерезис, и защита по времени.
+// Медиана замеров паузы: одиночный выброс АЦП не должен ни продлить полив,
+// ни остановить его раньше времени.
+uint8_t waterMedianPct() {
+  uint8_t v[WATER_MEASURES];
+  const uint8_t n = waterSampleN;
+  for (uint8_t i = 0; i < n; ++i) v[i] = waterSamplePct[i];
+
+  for (uint8_t i = 1; i < n; ++i) {          // вставками: n ≤ 3
+    const uint8_t x = v[i];
+    int8_t j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; --j; }
+    v[j + 1] = x;
+  }
+  return n ? v[n / 2] : 0;
+}
+
+const char* waterStateName() {
+  switch (waterState) {
+    case WaterState::RUN:   return "on";
+    case WaterState::PAUSE: return "pause";
+    default:                return "idle";
+  }
+}
+
+// Сколько секунд осталось до конца текущей фазы (0 — фазы нет).
+uint32_t waterLeftS(uint32_t now) {
+  int32_t left = 0;
+  if (waterState == WaterState::RUN)        left = (int32_t)(pumpStartedAt + WATER_ON_MS - now);
+  else if (waterState == WaterState::PAUSE) left = (int32_t)(waterPauseUntil - now);
+  return left > 0 ? (uint32_t)left / 1000UL : 0;
+}
+
+// Очередная порция: помпа на WATER_ON_MS, дальше пауза с замерами.
+void waterStartCycle(uint32_t now) {
+  ++waterCycle;
+  waterState    = WaterState::RUN;
+  pumpStartedAt = now;
+  waterSampleN  = 0;
+  pumpSet(true);
+  screenDirty = true;
+  Serial.printf("Water: cycle %u/%u, on %lu s\n", waterCycle, WATER_MAX_CYCLES,
+                (unsigned long)(WATER_ON_MS / 1000UL));
+}
+
+// Вызывается в каждом проходе loop(): ручные режимы, циклы полива, защита.
 void updatePump(uint32_t now) {
   // Ручной режим имеет приоритет над автоматикой, но ограничен по времени.
   if (pumpMode == PumpMode::MANUAL_ON) {
@@ -287,36 +367,76 @@ void updatePump(uint32_t now) {
     return;
   }
 
-  if (!pumpOn) {
-    const bool ready = (int32_t)(now - pumpLockUntil) >= 0;
-    if (ready && soilOk && soilPercent <= SOIL_PUMP_ON_PCT) {
-      pumpStartedAt = now;
-      pumpSet(true);
-      Serial.printf("Pump: ON (soil %d %%)\n", soilPercent);
+  // --- Автоматика: циклы «15 с полив / 20 с пауза с замерами» ---
+  if (waterState == WaterState::RUN) {
+    if (!soilOk) {                       // датчик отвалился — стоп немедленно
+      pumpSet(false);
+      if (soilFaultCount >= SOIL_FAULT_LOCK_AFTER) {
+        pumpLockUntil = now + PUMP_COOLDOWN_MS;
+      }
+      waterReset();
+      Serial.println("Water: aborted (sensor)");
+      return;
+    }
+
+    if (now - pumpStartedAt >= WATER_ON_MS) {
+      pumpSet(false);
+      waterState      = WaterState::PAUSE;
+      waterPauseUntil = now + WATER_PAUSE_MS;
+      nextMeasureAt   = now + WATER_MEASURE_STEP;
+      waterSampleN    = 0;
+      screenDirty     = true;
+      Serial.println("Water: pause");
+      return;
+    }
+
+    if (now - pumpStartedAt >= PUMP_MAX_MS) {   // страховка, сработать не должна
+      pumpSet(false);
+      waterReset();
+      pumpLockUntil = now + PUMP_COOLDOWN_MS;
+      Serial.println("Water: aborted (timeout)");
     }
     return;
   }
 
-  const char* reason = nullptr;
-
-  if (!soilOk) {                                          // датчик отвалился
-    if (soilFaultCount >= SOIL_FAULT_LOCK_AFTER) {
-      reason = "sensor error";
-      pumpLockUntil = now + PUMP_COOLDOWN_MS;
-    } else {
-      reason = "sensor glitch";                           // одиночный выброс
+  if (waterState == WaterState::PAUSE) {
+    // Замеры разнесены по паузе: вода успевает впитаться, а не остаётся
+    // на поверхности. Неудачное чтение просто не попадает в выборку.
+    if (waterSampleN < WATER_MEASURES && (int32_t)(now - nextMeasureAt) >= 0) {
+      readSoil();
+      if (soilOk) waterSamplePct[waterSampleN++] = (uint8_t)soilPercent;
+      nextMeasureAt += WATER_MEASURE_STEP;   // от расписания, а не от «сейчас»
     }
-  } else if (now - pumpStartedAt >= PUMP_MAX_MS) {        // слишком долго льём
-    reason = "timeout";
-    pumpLockUntil = now + PUMP_COOLDOWN_MS;
-  } else if (now - pumpStartedAt >= PUMP_MIN_ON_MS &&
-             soilPercent >= SOIL_PUMP_OFF_PCT) {          // уже достаточно мокро
-    reason = "soil wet";
+
+    if ((int32_t)(now - waterPauseUntil) < 0) return;
+
+    if (waterSampleN == 0) {             // датчик так и не ответил
+      waterReset();
+      Serial.println("Water: aborted (no samples)");
+      return;
+    }
+
+    const uint8_t pct = waterMedianPct();
+
+    if (pct >= SOIL_TARGET_PCT) {
+      waterReset();
+      pumpLockUntil = now + WATER_SETTLE_MS;
+      Serial.printf("Water: done, soil %u %%\n", pct);
+    } else if (waterCycle >= WATER_MAX_CYCLES) {
+      waterReset();
+      pumpLockUntil = now + WATER_RETRY_MS;
+      Serial.printf("Water: cycle limit, soil %u %%\n", pct);
+    } else {
+      waterStartCycle(now);
+    }
+    return;
   }
 
-  if (reason) {
-    pumpSet(false);
-    Serial.printf("Pump: OFF (%s), soil %d %%\n", reason, soilPercent);
+  // IDLE: ждём, пока почва подсохнет ниже порога.
+  const bool ready = (int32_t)(now - pumpLockUntil) >= 0;
+  if (ready && soilOk && soilPercent < SOIL_START_PCT) {
+    waterCycle = 0;
+    waterStartCycle(now);
   }
 }
 
@@ -361,7 +481,9 @@ void render() {
 
       const char* pumpTag = pumpOn
                               ? (pumpMode == PumpMode::MANUAL_ON ? "MAN" : "PUMP")
-                              : (pumpMode == PumpMode::MANUAL_OFF ? "HOLD" : "");
+                              : (pumpMode == PumpMode::MANUAL_OFF
+                                   ? "HOLD"
+                                   : (waterState == WaterState::PAUSE ? "WAIT" : ""));
 
       snprintf(row1, sizeof(row1), "%4u mV %-4s", soilMv, pumpTag);
       break;
@@ -570,12 +692,16 @@ const fmtUp = s => s < 3600 ? Math.floor(s / 60) + " мин"
 const fmtLeft = s => s >= 60 ? Math.floor(s / 60) + " мин" : s + " с";
 function pumpHtml(d) {
   let s = d.pump ? '<span class="on">ВКЛ</span>' : '<span class="off">выкл</span>';
+  let sub = "авто";
   if (d.mode === "on")
-    s += '<div class="k" style="margin-top:6px">ручной · ' + d.left + " с</div>";
+    sub = "ручной · " + d.left + " с";
   else if (d.mode === "off")
-    s += '<div class="k" style="margin-top:6px">ручной ВЫКЛ · ' + fmtLeft(d.left) + "</div>";
-  else
-    s += '<div class="k" style="margin-top:6px">авто</div>';
+    sub = "ручной ВЫКЛ · " + fmtLeft(d.left);
+  else if (d.ws === "on")
+    sub = "полив · " + d.wleft + " с · цикл " + d.cyc;
+  else if (d.ws === "pause")
+    sub = "пауза · " + d.wleft + " с · замер";
+  s += '<div class="k" style="margin-top:6px">' + sub + "</div>";
   return s;
 }
 async function setPump(state) {
@@ -626,10 +752,11 @@ void handleApi() {
   ClockText ct;
   clockText(ct);
 
-  char json[384];
+  char json[512];
   snprintf(json, sizeof(json),
            "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
            "\"soil_ok\":%s,\"pump\":%s,\"mode\":\"%s\",\"left\":%lu,"
+           "\"ws\":\"%s\",\"cyc\":%u,\"wleft\":%lu,"
            "\"time\":\"%s\",\"date\":\"%s\","
            "\"wd\":\"%s\",\"up\":%lu,\"rssi\":%d,\"ip\":\"%s\",\"token\":\"%s\"}",
            airOk ? temperature : 0.0f,
@@ -641,6 +768,9 @@ void handleApi() {
            pumpOn ? "true" : "false",
            pumpModeName(pumpMode),
            (unsigned long)manualLeftS(millis()),
+           waterStateName(),
+           (unsigned)waterCycle,
+           (unsigned long)waterLeftS(millis()),
            ct.time, ct.date, ct.wd,
            (unsigned long)(millis() / 1000UL),
            WiFi.RSSI(),
