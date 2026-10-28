@@ -9,6 +9,9 @@
    2) SOIL  — влажность почвы, опрос раз в 10 с
    3) CLOCK — время и дата с DS3231
 
+   Воздух и почва опрашиваются в любом режиме: данные нужны веб-серверу
+   и логике полива, а не только открытому экрану.
+
   Web:
    * http://<ip-адрес>        — страница с показаниями (обновление раз в 2 с)
    * http://<ip-адрес>/api    — те же данные в JSON
@@ -21,7 +24,10 @@
    * помпа не выключается раньше PUMP_MIN_ON_MS — защита реле;
    * не дольше PUMP_MAX_MS подряд, затем пауза PUMP_COOLDOWN_MS;
    * обрыв/КЗ датчика почвы — полив блокируется;
-   * почва опрашивается всегда, при старте помпа выключена.
+   * одиночный выброс АЦП выключает помпу, но не даёт паузу 60 с —
+     только серия из SOIL_FAULT_LOCK_AFTER ошибок подряд;
+   * почва опрашивается всегда, при старте помпа выключена:
+     уровень реле задаётся до pinMode(), иначе core 3.x его игнорирует.
 
   Часы:
    * DS3231 на шине I2C (SDA 21, SCL 22), адрес 0x68 (LCD — 0x27);
@@ -37,7 +43,7 @@
      отбрасываются — без блокировки loop(), энкодер не «залипает».
    * lcd.clear() в цикле убран: пишется только изменившаяся строка ровно
      на 16 символов — нет мерцания и «хвостов» от старых значений.
-   * Пока данные не обновились, шина I2C не используется вообще.
+   * Пока строка на LCD не изменилась, запись по I2C не выполняется.
    * WiFi подключается неблокирующе: loop() и энкодер работают во время
      соединения, при обрыве — повтор каждые 15 с.
    * Часы читаются 4 раза в секунду, LCD перерисовывается по смене секунды.
@@ -96,6 +102,14 @@ constexpr uint16_t SOIL_WET_MV = 700;          // вода  (100 %)
 // читается как ~0 мВ, а КЗ на 3.3 В — как насыщение АЦП.
 constexpr uint16_t SOIL_FAULT_MV_LOW  = 100;   // ниже — обрыв/нет датчика
 constexpr uint16_t SOIL_FAULT_MV_HIGH = 3050;  // выше — КЗ/насыщение
+// ВАЖНО: 3050 мВ — это уже почти насыщение АЦП (11 дБ ≈ 3.1 В). Если у вашего
+// датчика сухой выход выше ~2900 мВ, поднимите порог к 3080–3100, иначе
+// исправный датчик будет считаться аварийным и полив заблокируется.
+
+// Сколько подряд ошибочных чтений считать аварией датчика.
+// Помпа выключается сразу при любом сбое, но пауза 60 с включается только
+// после серии: одиночный выброс АЦП не должен останавливать полив на минуту.
+constexpr uint8_t SOIL_FAULT_LOCK_AFTER = 3;
 
 // Сколько отсчётов АЦП берём и сколько отбрасываем с каждого края
 constexpr uint8_t SOIL_SAMPLES = 15;
@@ -157,6 +171,7 @@ float    temperature = 0;
 float    humidity    = 0;
 uint16_t soilMv      = 0;
 int      soilPercent = 0;
+uint8_t  soilFaultCount = 0;   // подряд ошибочных чтений почвы
 DateTime clockNow;
 
 bool airOk       = false;
@@ -191,8 +206,12 @@ void updatePump(uint32_t now) {
   const char* reason = nullptr;
 
   if (!soilOk) {                                          // датчик отвалился
-    reason = "sensor error";
-    pumpLockUntil = now + PUMP_COOLDOWN_MS;
+    if (soilFaultCount >= SOIL_FAULT_LOCK_AFTER) {
+      reason = "sensor error";
+      pumpLockUntil = now + PUMP_COOLDOWN_MS;
+    } else {
+      reason = "sensor glitch";                           // одиночный выброс
+    }
   } else if (now - pumpStartedAt >= PUMP_MAX_MS) {        // слишком долго льём
     reason = "timeout";
     pumpLockUntil = now + PUMP_COOLDOWN_MS;
@@ -303,8 +322,14 @@ uint16_t readSoilTrimmedMv() {
 }
 
 void readSoil() {
-  soilMv  = readSoilTrimmedMv();
-  soilOk  = soilMv > SOIL_FAULT_MV_LOW && soilMv < SOIL_FAULT_MV_HIGH;
+  soilMv = readSoilTrimmedMv();
+  soilOk = soilMv > SOIL_FAULT_MV_LOW && soilMv < SOIL_FAULT_MV_HIGH;
+
+  if (soilOk) {
+    soilFaultCount = 0;
+  } else if (soilFaultCount < 255) {
+    ++soilFaultCount;
+  }
 
   soilPercent = soilOk
                   ? constrain(map(soilMv, SOIL_DRY_MV, SOIL_WET_MV, 0, 100), 0, 100)
@@ -313,8 +338,12 @@ void readSoil() {
   screenDirty = true;
 
   if (view == View::SOIL || !soilOk) {
-    Serial.printf("Soil: %d %%, %u mV%s\n", soilPercent, soilMv,
-                  soilOk ? "" : " (sensor error)");
+    const char* note = "";
+    if (!soilOk) {
+      note = (soilFaultCount >= SOIL_FAULT_LOCK_AFTER) ? " (sensor error)"
+                                                       : " (glitch)";
+    }
+    Serial.printf("Soil: %d %%, %u mV%s\n", soilPercent, soilMv, note);
   }
 }
 
@@ -503,8 +532,14 @@ void switchView(View v) {
 // ---------------- setup ----------------
 void setup() {
   // Реле выключаем в первую очередь — до всего остального.
-  digitalWrite(PUMP_PIN, !PUMP_ON_LEVEL);
+  // В ESP32 core 3.x digitalWrite() до pinMode() игнорируется:
+  // __digitalWrite() пишет только в пин, уже зарегистрированный как GPIO.
+  // Поэтому сначала задаём уровень защёлки напрямую, потом включаем выход
+  // (иначе после pinMode(OUTPUT) на активном низком реле помпа включится).
+  gpio_set_level((gpio_num_t)PUMP_PIN, !PUMP_ON_LEVEL);
   pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, !PUMP_ON_LEVEL);   // страховка: точно выключено
+  pumpOn = false;
 
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -570,7 +605,9 @@ void loop() {
     readSoil();
   }
 
-  if (view == View::AIR && (int32_t)(now - nextAir) >= 0) {
+  // Воздух тоже опрашивается в любом режиме: данные нужны не только экрану,
+  // но и /api, иначе на SOIL/CLOCK они «замерзают» на последнем замере.
+  if ((int32_t)(now - nextAir) >= 0) {
     nextAir = now + (readAir() ? INTERVAL_AIR : RETRY_MS);
   }
 
