@@ -16,7 +16,8 @@
    * http://<ip-адрес>        — страница с показаниями (обновление раз в 2 с)
    * http://<ip-адрес>/api    — те же данные в JSON
    * http://dht22.local       — то же самое по mDNS (если сеть умеет)
-   * сервер только читает данные, ничего не переключает и не поливает.
+   * POST /pump (state=on|off|auto) — ручное управление помпой;
+     запрос защищён одноразовым токеном, страница получает его из /api.
 
   Полив:
    * влажность <= 20 %  → реле включает помпу (пин 27);
@@ -27,7 +28,9 @@
    * одиночный выброс АЦП выключает помпу, но не даёт паузу 60 с —
      только серия из SOIL_FAULT_LOCK_AFTER ошибок подряд;
    * почва опрашивается всегда, при старте помпа выключена:
-     уровень реле задаётся до pinMode(), иначе core 3.x его игнорирует.
+     уровень реле задаётся до pinMode(), иначе core 3.x его игнорирует;
+   * ручной режим из web: ВКЛ — максимум MANUAL_ON_MS (датчик игнорируется),
+     ВЫКЛ — автоматика на паузе MANUAL_OFF_MS, затем снова AUTO.
 
   Часы:
    * DS3231 на шине I2C (SDA 21, SCL 22), адрес 0x68 (LCD — 0x27);
@@ -60,6 +63,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <esp_random.h>
 
 // ---------------- WiFi ----------------
 // Логин и пароль — в secrets.h (он в .gitignore, на GitHub не попадает).
@@ -126,6 +130,12 @@ constexpr uint32_t PUMP_MIN_ON_MS   = 5UL * 1000UL;    // минимум раб�
 constexpr uint32_t PUMP_MAX_MS      = 30UL * 1000UL;   // максимум непрерывной работы
 constexpr uint32_t PUMP_COOLDOWN_MS = 60UL * 1000UL;   // пауза после аварии
 
+// Ручное управление из веб-интерфейса.
+// ВКЛ — принудительно, без проверки датчика, но не дольше этого времени.
+// ВЫКЛ — запрет автоматики на это время (потом снова AUTO).
+constexpr uint32_t MANUAL_ON_MS  = 60UL * 1000UL;          // 60 секунд
+constexpr uint32_t MANUAL_OFF_MS = 30UL * 60UL * 1000UL;   // 30 минут
+
 constexpr uint32_t INTERVAL_AIR  = 5UL * 60UL * 1000UL;   // воздух — 5 минут
 constexpr uint32_t INTERVAL_SOIL = 10UL * 1000UL;         // почва — 10 секунд
 constexpr uint32_t CLOCK_REFRESH = 250;                   // опрос DS3231
@@ -141,8 +151,15 @@ DHT dht(DHT_PIN, DHT_TYPE);
 RTC_DS3231 rtc;
 WebServer server(80);
 
+// Токен от CSRF для POST /pump: генерируется при каждом старте и вшивается
+// в HTML. Чужой сайт не может прочитать страницу из-за same-origin policy,
+// поэтому не сможет отправить команду помпе.
+char webToken[9] = "00000000";
+
 enum class View : uint8_t { AIR, SOIL, CLOCK };
 constexpr uint8_t VIEW_COUNT = 3;
+
+enum class PumpMode : uint8_t { AUTO, MANUAL_ON, MANUAL_OFF };
 
 constexpr const char* const WEEKDAYS[7] = {
   "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
@@ -166,6 +183,9 @@ uint32_t nextClock   = 0;
 uint32_t nextWifiTry = 0;
 uint32_t pumpStartedAt = 0;
 uint32_t pumpLockUntil = 0;
+uint32_t manualEndsAt  = 0;
+
+PumpMode pumpMode = PumpMode::AUTO;
 
 float    temperature = 0;
 float    humidity    = 0;
@@ -191,8 +211,82 @@ void pumpSet(bool on) {
   screenDirty = true;
 }
 
+const char* pumpModeName(PumpMode m) {
+  switch (m) {
+    case PumpMode::MANUAL_ON:  return "on";
+    case PumpMode::MANUAL_OFF: return "off";
+    default:                   return "auto";
+  }
+}
+
+// Сколько секунд осталось до возврата в AUTO (0 — уже AUTO).
+uint32_t manualLeftS(uint32_t now) {
+  if (pumpMode == PumpMode::AUTO) return 0;
+  const int32_t left = (int32_t)(manualEndsAt - now);
+  return left > 0 ? (uint32_t)left / 1000UL : 0;
+}
+
+void pumpManualOn(uint32_t now) {
+  pumpMode      = PumpMode::MANUAL_ON;
+  manualEndsAt  = now + MANUAL_ON_MS;
+  pumpStartedAt = now;
+  pumpSet(true);
+  screenDirty = true;
+  Serial.println("Pump: ON (manual)");
+}
+
+void pumpManualOff(uint32_t now) {
+  pumpMode      = PumpMode::MANUAL_OFF;
+  manualEndsAt  = now + MANUAL_OFF_MS;
+  pumpSet(false);
+  pumpLockUntil = manualEndsAt;   // авто не включит, пока действует ручной ВЫКЛ
+  screenDirty   = true;
+  Serial.println("Pump: OFF (manual)");
+}
+
+void pumpAuto(uint32_t now) {
+  if (pumpMode == PumpMode::MANUAL_ON) {
+    // Ручной полив уже шёл — останавливаем и даём почве впитать воду.
+    pumpSet(false);
+    pumpLockUntil = now + PUMP_COOLDOWN_MS;
+  } else if (pumpMode == PumpMode::MANUAL_OFF) {
+    pumpLockUntil = now;          // снять запрет автоматики
+  }
+  pumpMode    = PumpMode::AUTO;
+  screenDirty = true;
+  Serial.println("Pump: AUTO");
+}
+
 // Вызывается в каждом проходе loop(): и гистерезис, и защита по времени.
 void updatePump(uint32_t now) {
+  // Ручной режим имеет приоритет над автоматикой, но ограничен по времени.
+  if (pumpMode == PumpMode::MANUAL_ON) {
+    if ((int32_t)(now - manualEndsAt) >= 0) {
+      pumpSet(false);
+      pumpLockUntil = now + PUMP_COOLDOWN_MS;
+      pumpMode = PumpMode::AUTO;
+      screenDirty = true;
+      Serial.println("Pump: OFF (manual timeout)");
+      return;
+    }
+    if (!pumpOn) {                // страховка, если выход почему-то сбросился
+      pumpStartedAt = now;
+      pumpSet(true);
+    }
+    return;
+  }
+
+  if (pumpMode == PumpMode::MANUAL_OFF) {
+    if (pumpOn) pumpSet(false);
+    if ((int32_t)(now - manualEndsAt) >= 0) {
+      pumpLockUntil = now;
+      pumpMode = PumpMode::AUTO;
+      screenDirty = true;
+      Serial.println("Pump: AUTO (manual off timeout)");
+    }
+    return;
+  }
+
   if (!pumpOn) {
     const bool ready = (int32_t)(now - pumpLockUntil) >= 0;
     if (ready && soilOk && soilPercent <= SOIL_PUMP_ON_PCT) {
@@ -261,12 +355,17 @@ void render() {
   row1[0] = '\0';
 
   switch (view) {
-    case View::SOIL:
+    case View::SOIL: {
       if (soilOk) snprintf(row0, sizeof(row0), "Soil: %3d %%", soilPercent);
       else        snprintf(row0, sizeof(row0), "Soil: ---");
 
-      snprintf(row1, sizeof(row1), "%4u mV %-4s", soilMv, pumpOn ? "PUMP" : "");
+      const char* pumpTag = pumpOn
+                              ? (pumpMode == PumpMode::MANUAL_ON ? "MAN" : "PUMP")
+                              : (pumpMode == PumpMode::MANUAL_OFF ? "HOLD" : "");
+
+      snprintf(row1, sizeof(row1), "%4u mV %-4s", soilMv, pumpTag);
       break;
+    }
 
     case View::CLOCK: {
       ClockText ct;
@@ -440,6 +539,12 @@ h1{margin:0 0 16px;font-size:17px;font-weight:600;color:var(--dim)}
 .v{margin-top:4px;font-size:30px;font-weight:600;line-height:1.15}
 .v small{font-size:15px;font-weight:400;color:var(--dim)}
 .on{color:var(--ok)}.off{color:var(--dim)}.err{color:var(--bad)}
+.btns{display:flex;gap:6px;margin-top:12px}
+.btn{flex:1;padding:8px 4px;border:1px solid #2d3843;border-radius:8px;background:#222b34;
+     color:var(--fg);font:14px system-ui,Arial,sans-serif;cursor:pointer}
+.btn:hover{background:#2b3541}
+.btn.on{border-color:var(--ok);color:var(--ok)}
+.btn.off{border-color:var(--bad);color:var(--bad)}
 footer{margin-top:16px;color:var(--dim);font-size:13px}
 </style></head><body>
 <h1>ESP32 · датчики и климат</h1>
@@ -447,25 +552,59 @@ footer{margin-top:16px;color:var(--dim);font-size:13px}
 <div class="card"><div class="k">Температура</div><div class="v" id="t">—</div></div>
 <div class="card"><div class="k">Влажность воздуха</div><div class="v" id="h">—</div></div>
 <div class="card"><div class="k">Влажность почвы</div><div class="v" id="s">—</div></div>
-<div class="card"><div class="k">Помпа</div><div class="v" id="p">—</div></div>
+<div class="card"><div class="k">Помпа</div><div class="v" id="p">—</div>
+<div class="btns">
+<button class="btn on" onclick="setPump('on')" title="Включить вручную на 60 секунд">ВКЛ</button>
+<button class="btn off" onclick="setPump('off')" title="Выключить и не поливать 30 минут">ВЫКЛ</button>
+<button class="btn" onclick="setPump('auto')" title="Вернуть автоматический режим">АВТО</button>
+</div></div>
 <div class="card"><div class="k">Время</div><div class="v" id="tm">—</div></div>
 <div class="card"><div class="k">Дата</div><div class="v" id="dt">—</div></div>
 </div>
 <footer id="st">подключение…</footer>
 <script>
+let TOKEN = "%TOKEN%";
 const $ = id => document.getElementById(id);
 const fmtUp = s => s < 3600 ? Math.floor(s / 60) + " мин"
                             : Math.floor(s / 3600) + " ч " + Math.floor(s % 3600 / 60) + " мин";
+const fmtLeft = s => s >= 60 ? Math.floor(s / 60) + " мин" : s + " с";
+function pumpHtml(d) {
+  let s = d.pump ? '<span class="on">ВКЛ</span>' : '<span class="off">выкл</span>';
+  if (d.mode === "on")
+    s += '<div class="k" style="margin-top:6px">ручной · ' + d.left + " с</div>";
+  else if (d.mode === "off")
+    s += '<div class="k" style="margin-top:6px">ручной ВЫКЛ · ' + fmtLeft(d.left) + "</div>";
+  else
+    s += '<div class="k" style="margin-top:6px">авто</div>';
+  return s;
+}
+async function setPump(state) {
+  if (state === "on" && !confirm("Включить помпу вручную на 60 секунд?")) return;
+  try {
+    const r = await fetch("/pump", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "state=" + encodeURIComponent(state) + "&token=" + encodeURIComponent(TOKEN)
+    });
+    if (!r.ok) throw new Error(r.status + " " + (await r.text()));
+    await tick();
+  } catch (e) {
+    $("st").textContent = "помпа: " + e.message + " — обновите страницу";
+  }
+}
 async function tick() {
   try {
     const r = await fetch("/api", { cache: "no-store" });
     const d = await r.json();
+    // Токен приходит заново при каждом опросе: если ESP32 перезагрузилась
+    // после открытия страницы, команда всё равно пройдёт.
+    if (d.token) TOKEN = d.token;
     $("t").innerHTML = d.t_ok ? d.t.toFixed(1) + "<small> °C</small>" : '<span class="err">ошибка</span>';
     $("h").innerHTML = d.t_ok ? d.h.toFixed(1) + "<small> %</small>" : '<span class="err">ошибка</span>';
     $("s").innerHTML = d.soil_ok
       ? d.soil + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" + d.mv + " мВ</div>"
       : '<span class="err">датчик</span>';
-    $("p").innerHTML = d.pump ? '<span class="on">ВКЛ</span>' : '<span class="off">выкл</span>';
+    $("p").innerHTML = pumpHtml(d);
     $("tm").textContent = d.time;
     $("dt").textContent = d.date + " " + d.wd;
     $("st").textContent = "IP " + d.ip + " · RSSI " + d.rssi + " dBm · работает " + fmtUp(d.up);
@@ -477,19 +616,22 @@ tick(); setInterval(tick, 2000);
 </script></body></html>)html";
 
 void handleRoot() {
+  String page = INDEX_HTML;
+  page.replace("%TOKEN%", webToken);
   server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html", INDEX_HTML);
+  server.send(200, "text/html", page);
 }
 
 void handleApi() {
   ClockText ct;
   clockText(ct);
 
-  char json[256];
+  char json[384];
   snprintf(json, sizeof(json),
            "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
-           "\"soil_ok\":%s,\"pump\":%s,\"time\":\"%s\",\"date\":\"%s\","
-           "\"wd\":\"%s\",\"up\":%lu,\"rssi\":%d,\"ip\":\"%s\"}",
+           "\"soil_ok\":%s,\"pump\":%s,\"mode\":\"%s\",\"left\":%lu,"
+           "\"time\":\"%s\",\"date\":\"%s\","
+           "\"wd\":\"%s\",\"up\":%lu,\"rssi\":%d,\"ip\":\"%s\",\"token\":\"%s\"}",
            airOk ? temperature : 0.0f,
            airOk ? "true" : "false",
            airOk ? humidity : 0.0f,
@@ -497,13 +639,63 @@ void handleApi() {
            (unsigned)soilMv,
            soilOk ? "true" : "false",
            pumpOn ? "true" : "false",
+           pumpModeName(pumpMode),
+           (unsigned long)manualLeftS(millis()),
            ct.time, ct.date, ct.wd,
            (unsigned long)(millis() / 1000UL),
            WiFi.RSSI(),
-           WiFi.localIP().toString().c_str());
+           WiFi.localIP().toString().c_str(),
+           webToken);
 
   server.sendHeader("Cache-Control", "no-store, max-age=0");
   server.send(200, "application/json", json);
+}
+
+// POST /pump, body: state=on|off|auto + token=<токен>.
+// Токен принимается и в заголовке X-Pump-Token (для ручных запросов).
+// GET намеренно не поддерживаем: команду нельзя послать простой ссылкой
+// или картинкой с чужого сайта.
+void handlePump() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Allow", "POST");
+    server.send(405, "text/plain", "POST only");
+    return;
+  }
+
+  // Токен ищем сначала в теле запроса: разбор POST-аргументов не зависит
+  // от того, собирает ли WebServer заголовки.
+  const String bodyTok = server.arg(String("token"));
+  const String headTok = server.header(String("X-Pump-Token"));
+
+  if (!bodyTok.equals(webToken) && !headTok.equals(webToken)) {
+    // В ответе только длины, а не значения: так видно причину, но токен не утекает.
+    char msg[64];
+    snprintf(msg, sizeof(msg), "forbidden body=%u hdr=%u",
+             (unsigned)bodyTok.length(), (unsigned)headTok.length());
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(403, "text/plain", msg);
+    return;
+  }
+
+  const String state = server.arg(String("state"));
+  const uint32_t now = millis();
+
+  if (state == "on")        pumpManualOn(now);
+  else if (state == "off")  pumpManualOff(now);
+  else if (state == "auto") pumpAuto(now);
+  else {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"state\"}");
+    return;
+  }
+
+  char resp[96];
+  snprintf(resp, sizeof(resp),
+           "{\"ok\":true,\"mode\":\"%s\",\"pump\":%s}",
+           pumpModeName(pumpMode), pumpOn ? "true" : "false");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", resp);
 }
 
 // ---------------- Экраны ----------------
@@ -571,8 +763,12 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   nextWifiTry = millis() + WIFI_RETRY_MS;
 
+  // CSRF-токен для ручного управления помпой, новый на каждый старт.
+  snprintf(webToken, sizeof(webToken), "%08lx", (unsigned long)esp_random());
+
   server.on("/", handleRoot);
   server.on("/api", handleApi);
+  server.on("/pump", HTTP_POST, handlePump);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
 
