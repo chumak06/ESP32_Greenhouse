@@ -1,13 +1,14 @@
 /*
-  ESP32: DHT22 + ёмкостный датчик почвы + помпа на реле + RTC DS3231
-         + LCD 16x2 (I2C) + энкодер + веб-сервер
+  ESP32: DHT22 + ёмкостный датчик почвы + датчик освещённости + помпа на реле
+         + RTC DS3231 + LCD 16x2 (I2C) + энкодер + веб-сервер
 
-  Экранов три, переключаются энкодером по кругу
+  Экранов четыре, переключаются энкодером по кругу
   (вправо — следующий, влево — предыдущий):
 
    1) AIR   — температура и влажность воздуха (DHT22), опрос раз в 5 мин
    2) SOIL  — влажность почвы, опрос раз в 10 с
-   3) CLOCK — время и дата с DS3231
+   3) LIGHT — освещённость (фоторезистор на GPIO34), опрос раз в 5 с
+   4) CLOCK — время и дата с DS3231
 
    Воздух и почва опрашиваются в любом режиме: данные нужны веб-серверу
    и логике полива, а не только открытому экрану.
@@ -89,6 +90,7 @@ constexpr uint8_t ENC_DT  = 26;
 constexpr uint8_t ENC_SW  = 14;
 
 constexpr uint8_t SOIL_PIN = 32;               // ADC1 — работает вместе с WiFi
+constexpr uint8_t LIGHT_PIN = 34;              // ADC1, только вход (у GPIO16 АЦП нет)
 constexpr uint8_t PUMP_PIN = 27;
 
 constexpr uint8_t I2C_SDA = 21;
@@ -96,6 +98,16 @@ constexpr uint8_t I2C_SCL = 22;
 
 constexpr uint8_t LCD_COLS = 16;
 constexpr uint8_t LCD_ROWS = 2;
+
+// ---------------- Калибровка датчика освещённости (мВ) ----------------
+// Аналоговый модуль (фоторезистор + делитель), выход AO → GPIO34.
+// GPIO16 (D16) для этого не подходит: у него нет АЦП.
+// Калибровка: монитор порта 115200 — накройте датчик рукой и запишите мВ,
+// затем дайте яркий свет. Если у модуля зависимость обратная (в темноте
+// напряжение больше), просто поменяйте значения местами.
+constexpr uint16_t LIGHT_DARK_MV   = 3000;   // темнота (0 %)
+constexpr uint16_t LIGHT_BRIGHT_MV = 200;  // яркий свет (100 %)
+constexpr uint8_t  LIGHT_SAMPLES   = 5;     // отсчётов на замер (среднее)
 
 // ---------------- Калибровка датчика почвы (мВ) ----------------
 // Датчик ёмкостный, питание 3.3 В.
@@ -154,6 +166,7 @@ constexpr uint32_t MANUAL_OFF_MS = 30UL * 60UL * 1000UL;   // 30 минут
 
 constexpr uint32_t INTERVAL_AIR  = 5UL * 60UL * 1000UL;   // воздух — 5 минут
 constexpr uint32_t INTERVAL_SOIL = 10UL * 1000UL;         // почва — 10 секунд
+constexpr uint32_t INTERVAL_LIGHT = 5UL * 1000UL;         // свет — 5 секунд
 constexpr uint32_t CLOCK_REFRESH = 250;                   // опрос DS3231
 constexpr uint32_t RETRY_MS      = 2000;                  // повтор после ошибки DHT22
 constexpr uint32_t WARMUP_MS     = 2000;                  // прогрев DHT22 после старта
@@ -172,8 +185,8 @@ WebServer server(80);
 // поэтому не сможет отправить команду помпе.
 char webToken[9] = "00000000";
 
-enum class View : uint8_t { AIR, SOIL, CLOCK };
-constexpr uint8_t VIEW_COUNT = 3;
+enum class View : uint8_t { AIR, SOIL, LIGHT, CLOCK };
+constexpr uint8_t VIEW_COUNT = 4;
 
 enum class PumpMode : uint8_t { AUTO, MANUAL_ON, MANUAL_OFF };
 
@@ -198,6 +211,7 @@ char     screen[LCD_ROWS][LCD_COLS + 1];       // то, что уже на эк�
 
 uint32_t nextAir     = 0;
 uint32_t nextSoil    = 0;
+uint32_t nextLight   = 0;
 uint32_t nextClock   = 0;
 uint32_t nextWifiTry = 0;
 uint32_t pumpStartedAt = 0;
@@ -217,6 +231,8 @@ float    temperature = 0;
 float    humidity    = 0;
 uint16_t soilMv      = 0;
 int      soilPercent = 0;
+uint16_t lightMv      = 0;
+int      lightPercent = 0;
 uint8_t  soilFaultCount = 0;   // подряд ошибочных чтений почвы
 DateTime clockNow;
 
@@ -489,6 +505,12 @@ void render() {
       break;
     }
 
+    case View::LIGHT: {
+      snprintf(row0, sizeof(row0), "Light: %3d %%", lightPercent);
+      snprintf(row1, sizeof(row1), "%4u mV", lightMv);
+      break;
+    }
+
     case View::CLOCK: {
       ClockText ct;
       clockText(ct);
@@ -565,6 +587,27 @@ void readSoil() {
                                                        : " (glitch)";
     }
     Serial.printf("Soil: %d %%, %u mV%s\n", soilPercent, soilMv, note);
+  }
+}
+
+// ---------------- Датчик освещённости ----------------
+// GPIO34 — вход только, без внутренней подтяжки: модулю она и не нужна,
+// у него свой делитель. АЦП1, поэтому Wi-Fi не мешает замерам.
+uint16_t readLightMv() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < LIGHT_SAMPLES; ++i) {
+    sum += analogReadMilliVolts(LIGHT_PIN);
+  }
+  return (uint16_t)(sum / LIGHT_SAMPLES);
+}
+
+void readLight() {
+  lightMv      = readLightMv();
+  lightPercent = constrain(map(lightMv, LIGHT_DARK_MV, LIGHT_BRIGHT_MV, 0, 100), 0, 100);
+  screenDirty  = true;
+
+  if (view == View::LIGHT) {
+    Serial.printf("Light: %d %%, %u mV\n", lightPercent, lightMv);
   }
 }
 
@@ -659,9 +702,10 @@ void handleApi() {
   ClockText ct;
   clockText(ct);
 
-  char json[512];
+  char json[576];
   snprintf(json, sizeof(json),
            "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
+           "\"light\":%d,\"light_mv\":%u,"
            "\"soil_ok\":%s,\"pump\":%s,\"mode\":\"%s\",\"left\":%lu,"
            "\"ws\":\"%s\",\"cyc\":%u,\"wleft\":%lu,"
            "\"time\":\"%s\",\"date\":\"%s\","
@@ -671,6 +715,8 @@ void handleApi() {
            airOk ? humidity : 0.0f,
            soilOk ? soilPercent : 0,
            (unsigned)soilMv,
+           lightPercent,
+           (unsigned)lightMv,
            soilOk ? "true" : "false",
            pumpOn ? "true" : "false",
            pumpModeName(pumpMode),
@@ -739,6 +785,7 @@ void handlePump() {
 const char* viewName(View v) {
   switch (v) {
     case View::SOIL:  return "SOIL";
+    case View::LIGHT: return "LIGHT";
     case View::CLOCK: return "CLOCK";
     default:          return "AIR";
   }
@@ -753,6 +800,7 @@ void switchView(View v) {
   const uint32_t now = millis();
   if (v == View::AIR)   nextAir   = now;   // свежие данные сразу
   if (v == View::SOIL)  nextSoil  = now;
+  if (v == View::LIGHT) nextLight = now;
   if (v == View::CLOCK) nextClock = now;
 
   Serial.printf("Screen: %s\n", viewName(v));
@@ -774,6 +822,8 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   analogReadResolution(12);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);   // 0…~3.1 В
+  analogSetPinAttenuation(LIGHT_PIN, ADC_11db);
+  pinMode(LIGHT_PIN, INPUT);                     // GPIO34 — вход только
 
   lcd.init();
   lcd.backlight();
@@ -811,6 +861,7 @@ void setup() {
 
   nextAir   = millis() + WARMUP_MS;   // вместо delay(2000) — не блокируем loop()
   nextSoil  = millis();
+  nextLight = millis();
   nextClock = millis();
 
   drawRow(0, "Init...");
@@ -842,6 +893,12 @@ void loop() {
   // но и /api, иначе на SOIL/CLOCK они «замерзают» на последнем замере.
   if ((int32_t)(now - nextAir) >= 0) {
     nextAir = now + (readAir() ? INTERVAL_AIR : RETRY_MS);
+  }
+
+  // Освещённость — раз в 5 секунд, тоже в любом режиме.
+  if ((int32_t)(now - nextLight) >= 0) {
+    nextLight = now + INTERVAL_LIGHT;
+    readLight();
   }
 
   // Часы читаем всегда — они нужны и на экране, и в /api.

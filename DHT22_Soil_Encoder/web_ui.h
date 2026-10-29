@@ -33,6 +33,7 @@ footer{margin-top:16px;color:var(--dim);font-size:13px}
 <div class="card"><div class="k">Температура</div><div class="v" id="t">—</div></div>
 <div class="card"><div class="k">Влажность воздуха</div><div class="v" id="h">—</div></div>
 <div class="card"><div class="k">Влажность почвы</div><div class="v" id="s">—</div></div>
+<div class="card"><div class="k">Освещённость</div><div class="v" id="l">—</div></div>
 <div class="card"><div class="k">Помпа</div><div class="v" id="p">—</div>
 <div class="btns">
 <button class="btn on" onclick="setPump('on')" title="Включить вручную на 60 секунд">ВКЛ</button>
@@ -89,6 +90,8 @@ async function tick() {
     $("s").innerHTML = d.soil_ok
       ? d.soil + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" + d.mv + " мВ</div>"
       : '<span class="err">датчик</span>';
+    $("l").innerHTML = d.light + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" +
+                       d.light_mv + " мВ</div>";
     $("p").innerHTML = pumpHtml(d);
     $("tm").textContent = d.time;
     $("dt").textContent = d.date + " " + d.wd;
