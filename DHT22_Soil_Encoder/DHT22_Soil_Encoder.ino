@@ -65,7 +65,7 @@
    * Пока строка на LCD не изменилась, запись по I2C не выполняется.
    * WiFi подключается неблокирующе: loop() и энкодер работают во время
      соединения, при обрыве — повтор каждые 15 с.
-   * Часы читаются 4 раза в секунду, LCD перерисовывается по смене секунды.
+   * Часы читаются 2 раза в секунду, LCD перерисовывается по смене секунды.
    * Ошибка чтения DHT22 — повтор через 2 с, а не через 5 минут.
    * Нет delay(2000) в setup() — прогрев датчика не блокирует энкодер.
    * Время в uint32_t, сравнение разностей — переполнение millis() не страшно.
@@ -209,7 +209,10 @@ constexpr uint32_t MANUAL_OFF_MS = 30UL * 60UL * 1000UL;   // 30 минут
 constexpr uint32_t INTERVAL_AIR  = 5UL * 60UL * 1000UL;   // воздух — 5 минут
 constexpr uint32_t INTERVAL_SOIL = 10UL * 1000UL;         // почва — 10 секунд
 constexpr uint32_t INTERVAL_LIGHT = 5UL * 1000UL;         // свет — 5 секунд
-constexpr uint32_t CLOCK_REFRESH = 250;                   // опрос DS3231
+// Часы на LCD показывают секунды, поэтому двух опросов DS3231 в секунду
+// достаточно: секунда обновится с задержкой не больше 0,5 с, а I2C-трафик
+// вдвое меньше (шина делится с LCD).
+constexpr uint32_t CLOCK_REFRESH = 500;
 constexpr uint32_t RETRY_MS      = 2000;                  // повтор после ошибки DHT22
 constexpr uint32_t WARMUP_MS     = 2000;                  // прогрев DHT22 после старта
 
@@ -882,10 +885,24 @@ void serviceWiFi(uint32_t now) {
 #include "web_ui.h"
 
 void handleRoot() {
-  String page = INDEX_HTML;
-  page.replace("%TOKEN%", webToken);
+  // Страницу отдаём кусками прямо из flash: не копируем 6,6 КБ в String
+  // и не строим вторую строку в replace(). %TOKEN% подставляется между
+  // двумя частями, браузер получает тот же HTML.
+  const char* tok = strstr(INDEX_HTML, "%TOKEN%");
+  if (!tok) {
+    server.send(500, "text/plain", "token placeholder missing");
+    return;
+  }
+
+  const size_t head = (size_t)(tok - INDEX_HTML);
+  const size_t tail = strlen(tok + 7);
+
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html", page);
+  server.setContentLength(head + strlen(webToken) + tail);
+  server.send(200, "text/html", "");
+  server.sendContent(INDEX_HTML, head);
+  server.sendContent(webToken, strlen(webToken));
+  server.sendContent(tok + 7, tail);
 }
 
 void handleApi() {
