@@ -1,24 +1,27 @@
 /*
   ESP32: DHT22 + ёмкостный датчик почвы + датчик освещённости + помпа на реле
-         + RTC DS3231 + LCD 16x2 (I2C) + энкодер + веб-сервер
+         + светодиодная лента на реле + RTC DS3231 + LCD 16x2 (I2C)
+         + энкодер + веб-сервер
 
   Экранов четыре, переключаются энкодером по кругу
   (вправо — следующий, влево — предыдущий):
 
    1) AIR   — температура и влажность воздуха (DHT22), опрос раз в 5 мин
    2) SOIL  — влажность почвы, опрос раз в 10 с
-   3) LIGHT — освещённость (фоторезистор на GPIO34), опрос раз в 5 с
+   3) LIGHT — освещённость (фоторезистор на GPIO34), опрос раз в 5 с;
+              на второй строке мВ и метка LAMP, если подсветка включена
    4) CLOCK — время и дата с DS3231
 
-   Воздух и почва опрашиваются в любом режиме: данные нужны веб-серверу
-   и логике полива, а не только открытому экрану.
+   Воздух, почва и свет опрашиваются в любом режиме: данные нужны веб-серверу
+   и автоматике (полив, подсветка), а не только открытому экрану.
 
   Web:
    * http://<ip-адрес>        — страница с показаниями (обновление раз в 2 с)
    * http://<ip-адрес>/api    — те же данные в JSON
    * http://dht22.local       — то же самое по mDNS (если сеть умеет)
    * POST /pump (state=on|off|auto) — ручное управление помпой;
-     запрос защищён одноразовым токеном, страница получает его из /api.
+   * POST /lamp (state=on|off|auto) — ручное управление подсветкой;
+     оба запроса защищены одноразовым токеном, страница получает его из /api.
 
   Полив (циклами, порциями):
    * влажность <= 20 % (SOIL_START_PCT) → начинаем сессию полива;
@@ -36,6 +39,14 @@
    * ручной режим из web: ВКЛ — максимум MANUAL_ON_MS (датчик игнорируется),
      ВЫКЛ — автоматика на паузе MANUAL_OFF_MS, затем снова AUTO;
      ручная команда прерывает текущую сессию полива.
+
+  Подсветка (светодиодная лента через реле, пин 33):
+   * включается, когда освещённость ниже LIGHT_LAMP_ON_PCT (30 %);
+   * выключается, когда она выше LIGHT_LAMP_OFF_PCT (40 %) — гистерезис
+     не даёт лампе дребезжать на границе и мигать от облака;
+   * при старте выключена: уровень реле задаётся до pinMode();
+   * ручное управление из web: ВКЛ — на LAMP_MANUAL_ON_MS (1 ч), ВЫКЛ —
+     запрет автоматики на LAMP_MANUAL_OFF_MS (12 ч), затем снова AUTO.
 
   Часы:
    * DS3231 на шине I2C (SDA 21, SCL 22), адрес 0x68 (LCD — 0x27);
@@ -92,6 +103,7 @@ constexpr uint8_t ENC_SW  = 14;
 constexpr uint8_t SOIL_PIN = 32;               // ADC1 — работает вместе с WiFi
 constexpr uint8_t LIGHT_PIN = 34;              // ADC1, только вход (у GPIO16 АЦП нет)
 constexpr uint8_t PUMP_PIN = 27;
+constexpr uint8_t LAMP_PIN = 33;               // реле подсветки (свободный GPIO)
 
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
@@ -108,6 +120,19 @@ constexpr uint8_t LCD_ROWS = 2;
 constexpr uint16_t LIGHT_DARK_MV   = 3000;   // темнота (0 %)
 constexpr uint16_t LIGHT_BRIGHT_MV = 200;  // яркий свет (100 %)
 constexpr uint8_t  LIGHT_SAMPLES   = 5;     // отсчётов на замер (среднее)
+
+// Подсветка: светодиодная лента через реле. Включается в сумерках, а
+// выключается, только когда заметно светлее, — иначе на границе 30 %
+// лампа дребезжала бы от каждого облака.
+constexpr int LIGHT_LAMP_ON_PCT  = 30;   // темнее — включаем подсветку
+constexpr int LIGHT_LAMP_OFF_PCT = 40;   // светлее — выключаем
+
+// Ручное управление подсветкой из веб-интерфейса — та же идея, что у помпы:
+// забытая кнопка не должна держать ленту включённой вечно (вода не потопит,
+// но лампа в теплице ночью не нужна). ВКЛ — принудительно на 1 час, ВЫКЛ —
+// запрет автоматики на 12 часов, АВТО — вернуться к гистерезису.
+constexpr uint32_t LAMP_MANUAL_ON_MS  = 1UL * 60UL * 60UL * 1000UL;   // 1 час
+constexpr uint32_t LAMP_MANUAL_OFF_MS = 12UL * 60UL * 60UL * 1000UL;  // 12 часов
 
 // ---------------- Калибровка датчика почвы (мВ) ----------------
 // Датчик ёмкостный, питание 3.3 В.
@@ -152,10 +177,11 @@ constexpr uint8_t  WATER_MAX_CYCLES = 12;            // предохраните
 constexpr uint32_t WATER_SETTLE_MS = 60UL * 1000UL;        // 1 минута после успеха
 constexpr uint32_t WATER_RETRY_MS  = 10UL * 60UL * 1000UL;  // 10 минут после лимита
 
-// Релейный модуль с опторазвязкой — вход активный НИЗКИЙ.
+// Релейные модули с опторазвязкой — вход активный НИЗКИЙ.
 constexpr uint8_t PUMP_ON_LEVEL = LOW;
+constexpr uint8_t LAMP_ON_LEVEL = LOW;
 
-constexpr uint32_t PUMP_MAX_MS      = 30UL * 1000UL;   // максимум непрерывной работы
+constexpr uint32_t PUMP_MAX_MS      = 30UL * 1000UL;   // guard в updatePump(): макс. непрерывная работа
 constexpr uint32_t PUMP_COOLDOWN_MS = 60UL * 1000UL;   // пауза после аварии
 
 // Ручное управление из веб-интерфейса.
@@ -189,6 +215,7 @@ enum class View : uint8_t { AIR, SOIL, LIGHT, CLOCK };
 constexpr uint8_t VIEW_COUNT = 4;
 
 enum class PumpMode : uint8_t { AUTO, MANUAL_ON, MANUAL_OFF };
+enum class LampMode : uint8_t { AUTO, MANUAL_ON, MANUAL_OFF };
 
 // Фаза автоматического полива: льём / ждём и меряем / ждём следующего раза.
 enum class WaterState : uint8_t { IDLE, RUN, PAUSE };
@@ -222,6 +249,9 @@ uint32_t nextMeasureAt   = 0;
 
 PumpMode pumpMode = PumpMode::AUTO;
 
+LampMode lampMode = LampMode::AUTO;
+uint32_t lampManualEndsAt = 0;
+
 WaterState waterState    = WaterState::IDLE;
 uint8_t    waterCycle    = 0;                              // циклов в текущей сессии
 uint8_t    waterSampleN  = 0;                              // валидных замеров в паузе
@@ -241,6 +271,8 @@ bool soilOk      = false;
 bool rtcOk       = false;
 bool clockOk     = false;
 bool pumpOn      = false;
+bool lampOn      = false;
+bool lightValid  = false;      // было хотя бы одно чтение — можно управлять лампой
 bool netUp       = false;
 bool mdnsStarted = false;
 bool screenDirty = false;
@@ -296,6 +328,11 @@ void pumpManualOff(uint32_t now) {
 }
 
 void pumpAuto(uint32_t now) {
+  // Уже AUTO — это и есть запрошенный режим. Выходим, не трогая идущую
+  // сессию полива: иначе waterReset() обрывал бы её, а помпа продолжала
+  // работать и стартовала бы новый цикл с нуля.
+  if (pumpMode == PumpMode::AUTO) return;
+
   waterReset();
   if (pumpMode == PumpMode::MANUAL_ON) {
     // Ручной полив уже шёл — останавливаем и даём почве впитать воду.
@@ -355,16 +392,32 @@ void waterStartCycle(uint32_t now) {
 
 // Вызывается в каждом проходе loop(): ручные режимы, циклы полива, защита.
 void updatePump(uint32_t now) {
-  // Ручной режим имеет приоритет над автоматикой, но ограничен по времени.
+  // --- Общий guard непрерывной работы: один на все режимы ---
+  // Раньше проверка PUMP_MAX_MS сидела в фазе RUN и была недостижима
+  // (WATER_ON_MS < PUMP_MAX_MS). Теперь лимит один на всё: авто-циклы в него
+  // не упираются, но guard ловит «залипание» выхода в любом режиме; ручному
+  // ВКЛ разрешено MANUAL_ON_MS. Guard глушит помпу и завершает ручной режим,
+  // даже если та почему-то уже не работает.
+  const uint32_t maxRunMs =
+      (pumpMode == PumpMode::MANUAL_ON) ? MANUAL_ON_MS : PUMP_MAX_MS;
+  const bool runExpired    = pumpOn && (int32_t)(now - pumpStartedAt) >= (int32_t)maxRunMs;
+  const bool manualExpired = pumpMode == PumpMode::MANUAL_ON &&
+                             (int32_t)(now - manualEndsAt) >= 0;
+  if (runExpired || manualExpired) {
+    const PumpMode was = pumpMode;
+    pumpSet(false);
+    waterReset();
+    pumpLockUntil = now + PUMP_COOLDOWN_MS;
+    pumpMode      = PumpMode::AUTO;
+    screenDirty   = true;
+    if (was == PumpMode::MANUAL_ON) Serial.println("Pump: OFF (manual timeout)");
+    else                            Serial.println("Pump: OFF (run limit)");
+    return;
+  }
+
+  // Ручной режим имеет приоритет над автоматикой; его время проверяет
+  // общий guard выше.
   if (pumpMode == PumpMode::MANUAL_ON) {
-    if ((int32_t)(now - manualEndsAt) >= 0) {
-      pumpSet(false);
-      pumpLockUntil = now + PUMP_COOLDOWN_MS;
-      pumpMode = PumpMode::AUTO;
-      screenDirty = true;
-      Serial.println("Pump: OFF (manual timeout)");
-      return;
-    }
     if (!pumpOn) {                // страховка, если выход почему-то сбросился
       pumpStartedAt = now;
       pumpSet(true);
@@ -406,12 +459,8 @@ void updatePump(uint32_t now) {
       return;
     }
 
-    if (now - pumpStartedAt >= PUMP_MAX_MS) {   // страховка, сработать не должна
-      pumpSet(false);
-      waterReset();
-      pumpLockUntil = now + PUMP_COOLDOWN_MS;
-      Serial.println("Water: aborted (timeout)");
-    }
+    // Максимальное время непрерывной работы проверяет общий guard в начале
+    // функции: в обычном цикле сюда помпа просто не доживает (15 с < 30 с).
     return;
   }
 
@@ -507,7 +556,13 @@ void render() {
 
     case View::LIGHT: {
       snprintf(row0, sizeof(row0), "Light: %3d %%", lightPercent);
-      snprintf(row1, sizeof(row1), "%4u mV", lightMv);
+
+      // MAN — ручной ВКЛ, HOLD — ручной ВЫКЛ, LAMP — горит по автоматике.
+      const char* lampTag = lampOn
+                              ? (lampMode == LampMode::MANUAL_ON ? "MAN" : "LAMP")
+                              : (lampMode == LampMode::MANUAL_OFF ? "HOLD" : "");
+
+      snprintf(row1, sizeof(row1), "%4u mV %-4s", lightMv, lampTag);
       break;
     }
 
@@ -590,6 +645,84 @@ void readSoil() {
   }
 }
 
+// ---------------- Подсветка ----------------
+// Светодиодная лента питается от своего блока 12 В, реле рвёт плюс ленты.
+// ESP32 только дёргает вход релейного модуля — саму ленту он не питает.
+void lampSet(bool on) {
+  if (on == lampOn) return;
+  lampOn = on;
+  digitalWrite(LAMP_PIN, on ? LAMP_ON_LEVEL : !LAMP_ON_LEVEL);
+  screenDirty = true;
+}
+
+const char* lampModeName(LampMode m) {
+  switch (m) {
+    case LampMode::MANUAL_ON:  return "on";
+    case LampMode::MANUAL_OFF: return "off";
+    default:                   return "auto";
+  }
+}
+
+// Сколько секунд осталось до возврата подсветки в AUTO (0 — уже AUTO).
+uint32_t lampManualLeftS(uint32_t now) {
+  if (lampMode == LampMode::AUTO) return 0;
+  const int32_t left = (int32_t)(lampManualEndsAt - now);
+  return left > 0 ? (uint32_t)left / 1000UL : 0;
+}
+
+void lampManualOn(uint32_t now) {
+  lampMode         = LampMode::MANUAL_ON;
+  lampManualEndsAt = now + LAMP_MANUAL_ON_MS;
+  lampSet(true);
+  Serial.println("Lamp: ON (manual)");
+}
+
+void lampManualOff(uint32_t now) {
+  lampMode         = LampMode::MANUAL_OFF;
+  lampManualEndsAt = now + LAMP_MANUAL_OFF_MS;
+  lampSet(false);
+  Serial.println("Lamp: OFF (manual)");
+}
+
+void lampAuto() {
+  if (lampMode == LampMode::AUTO) return;
+  lampMode = LampMode::AUTO;
+  // К ближайшему проходу loop() гистерезис приведёт ленту к состоянию по датчику.
+  Serial.println("Lamp: AUTO");
+}
+
+// Вызывается из loop() на каждом проходе: ручные режимы ограничены по
+// времени, автоматика — гистерезис 30/40 %.
+void updateLamp(uint32_t now) {
+  if (lampMode == LampMode::MANUAL_ON) {
+    lampSet(true);
+    if ((int32_t)(now - lampManualEndsAt) >= 0) {
+      lampMode = LampMode::AUTO;
+      Serial.println("Lamp: AUTO (manual on timeout)");
+    }
+    return;
+  }
+
+  if (lampMode == LampMode::MANUAL_OFF) {
+    lampSet(false);
+    if ((int32_t)(now - lampManualEndsAt) >= 0) {
+      lampMode = LampMode::AUTO;
+      Serial.println("Lamp: AUTO (manual off timeout)");
+    }
+    return;
+  }
+
+  if (!lightValid) return;                 // данных ещё нет — не гадаем
+
+  if (!lampOn && lightPercent < LIGHT_LAMP_ON_PCT) {
+    lampSet(true);
+    Serial.printf("Lamp: ON (light %d %%)\n", lightPercent);
+  } else if (lampOn && lightPercent > LIGHT_LAMP_OFF_PCT) {
+    lampSet(false);
+    Serial.printf("Lamp: OFF (light %d %%)\n", lightPercent);
+  }
+}
+
 // ---------------- Датчик освещённости ----------------
 // GPIO34 — вход только, без внутренней подтяжки: модулю она и не нужна,
 // у него свой делитель. АЦП1, поэтому Wi-Fi не мешает замерам.
@@ -604,6 +737,7 @@ uint16_t readLightMv() {
 void readLight() {
   lightMv      = readLightMv();
   lightPercent = constrain(map(lightMv, LIGHT_DARK_MV, LIGHT_BRIGHT_MV, 0, 100), 0, 100);
+  lightValid   = true;
   screenDirty  = true;
 
   if (view == View::LIGHT) {
@@ -702,11 +836,12 @@ void handleApi() {
   ClockText ct;
   clockText(ct);
 
-  char json[576];
+  char json[640];
   snprintf(json, sizeof(json),
            "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
            "\"light\":%d,\"light_mv\":%u,"
-           "\"soil_ok\":%s,\"pump\":%s,\"mode\":\"%s\",\"left\":%lu,"
+           "\"soil_ok\":%s,\"pump\":%s,\"lamp\":%s,\"mode\":\"%s\",\"left\":%lu,"
+           "\"lm\":\"%s\",\"lleft\":%lu,"
            "\"ws\":\"%s\",\"cyc\":%u,\"wleft\":%lu,"
            "\"time\":\"%s\",\"date\":\"%s\","
            "\"wd\":\"%s\",\"up\":%lu,\"rssi\":%d,\"ip\":\"%s\",\"token\":\"%s\"}",
@@ -719,8 +854,11 @@ void handleApi() {
            (unsigned)lightMv,
            soilOk ? "true" : "false",
            pumpOn ? "true" : "false",
+           lampOn ? "true" : "false",
            pumpModeName(pumpMode),
            (unsigned long)manualLeftS(millis()),
+           lampModeName(lampMode),
+           (unsigned long)lampManualLeftS(millis()),
            waterStateName(),
            (unsigned)waterCycle,
            (unsigned long)waterLeftS(millis()),
@@ -734,6 +872,25 @@ void handleApi() {
   server.send(200, "application/json", json);
 }
 
+// Токен от CSRF для /pump и /lamp: ищем в теле запроса и в заголовке
+// X-Pump-Token. В ответе 403 — только длины, а не значения: видно причину,
+// но токен не утекает. При успехе возвращает true.
+bool tokenOk() {
+  // Токен ищем сначала в теле запроса: разбор POST-аргументов не зависит
+  // от того, собирает ли WebServer заголовки.
+  const String bodyTok = server.arg(String("token"));
+  const String headTok = server.header(String("X-Pump-Token"));
+
+  if (bodyTok.equals(webToken) || headTok.equals(webToken)) return true;
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "forbidden body=%u hdr=%u",
+           (unsigned)bodyTok.length(), (unsigned)headTok.length());
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(403, "text/plain", msg);
+  return false;
+}
+
 // POST /pump, body: state=on|off|auto + token=<токен>.
 // Токен принимается и в заголовке X-Pump-Token (для ручных запросов).
 // GET намеренно не поддерживаем: команду нельзя послать простой ссылкой
@@ -745,20 +902,7 @@ void handlePump() {
     return;
   }
 
-  // Токен ищем сначала в теле запроса: разбор POST-аргументов не зависит
-  // от того, собирает ли WebServer заголовки.
-  const String bodyTok = server.arg(String("token"));
-  const String headTok = server.header(String("X-Pump-Token"));
-
-  if (!bodyTok.equals(webToken) && !headTok.equals(webToken)) {
-    // В ответе только длины, а не значения: так видно причину, но токен не утекает.
-    char msg[64];
-    snprintf(msg, sizeof(msg), "forbidden body=%u hdr=%u",
-             (unsigned)bodyTok.length(), (unsigned)headTok.length());
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(403, "text/plain", msg);
-    return;
-  }
+  if (!tokenOk()) return;
 
   const String state = server.arg(String("state"));
   const uint32_t now = millis();
@@ -776,6 +920,39 @@ void handlePump() {
   snprintf(resp, sizeof(resp),
            "{\"ok\":true,\"mode\":\"%s\",\"pump\":%s}",
            pumpModeName(pumpMode), pumpOn ? "true" : "false");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", resp);
+}
+
+// POST /lamp — то же для подсветки: state=on|off|auto + token=<токен>.
+// ВКЛ — принудительно на LAMP_MANUAL_ON_MS (1 ч), ВЫКЛ — запрет автоматики
+// на LAMP_MANUAL_OFF_MS (12 ч), АВТО — вернуть гистерезис по датчику света.
+void handleLamp() {
+  if (server.method() != HTTP_POST) {
+    server.sendHeader("Allow", "POST");
+    server.send(405, "text/plain", "POST only");
+    return;
+  }
+
+  if (!tokenOk()) return;
+
+  const String state = server.arg(String("state"));
+  const uint32_t now = millis();
+
+  if (state == "on")        lampManualOn(now);
+  else if (state == "off")  lampManualOff(now);
+  else if (state == "auto") lampAuto();
+  else {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"state\"}");
+    return;
+  }
+
+  char resp[96];
+  snprintf(resp, sizeof(resp),
+           "{\"ok\":true,\"mode\":\"%s\",\"lamp\":%s}",
+           lampModeName(lampMode), lampOn ? "true" : "false");
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", resp);
@@ -818,6 +995,12 @@ void setup() {
   digitalWrite(PUMP_PIN, !PUMP_ON_LEVEL);   // страховка: точно выключено
   pumpOn = false;
 
+  // Реле подсветки — тот же приём: сначала защёлка, потом выход.
+  gpio_set_level((gpio_num_t)LAMP_PIN, !LAMP_ON_LEVEL);
+  pinMode(LAMP_PIN, OUTPUT);
+  digitalWrite(LAMP_PIN, !LAMP_ON_LEVEL);
+  lampOn = false;
+
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
   analogReadResolution(12);
@@ -856,6 +1039,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/api", handleApi);
   server.on("/pump", HTTP_POST, handlePump);
+  server.on("/lamp", HTTP_POST, handleLamp);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
 
@@ -908,6 +1092,9 @@ void loop() {
   }
 
   updatePump(now);
+
+  // Ручные режимы подсветки и гистерезис — на каждом проходе loop().
+  updateLamp(now);
 
   if (screenDirty) {
     render();

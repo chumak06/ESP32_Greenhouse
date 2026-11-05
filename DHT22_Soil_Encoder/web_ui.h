@@ -40,6 +40,12 @@ footer{margin-top:16px;color:var(--dim);font-size:13px}
 <button class="btn off" onclick="setPump('off')" title="Выключить и не поливать 30 минут">ВЫКЛ</button>
 <button class="btn" onclick="setPump('auto')" title="Вернуть автоматический режим">АВТО</button>
 </div></div>
+<div class="card"><div class="k">Подсветка</div><div class="v" id="lamp">—</div>
+<div class="btns">
+<button class="btn on" onclick="setLamp('on')" title="Включить вручную на 1 час">ВКЛ</button>
+<button class="btn off" onclick="setLamp('off')" title="Выключить и не включать 12 часов">ВЫКЛ</button>
+<button class="btn" onclick="setLamp('auto')" title="Вернуть автоматический режим">АВТО</button>
+</div></div>
 <div class="card"><div class="k">Время</div><div class="v" id="tm">—</div></div>
 <div class="card"><div class="k">Дата</div><div class="v" id="dt">—</div></div>
 </div>
@@ -64,10 +70,20 @@ function pumpHtml(d) {
   s += '<div class="k" style="margin-top:6px">' + sub + "</div>";
   return s;
 }
-async function setPump(state) {
-  if (state === "on" && !confirm("Включить помпу вручную на 60 секунд?")) return;
+function lampHtml(d) {
+  let s = d.lamp ? '<span class="on">ВКЛ</span>' : '<span class="off">выкл</span>';
+  let sub = "авто";
+  if (d.lm === "on")
+    sub = "ручной · " + fmtLeft(d.lleft);
+  else if (d.lm === "off")
+    sub = "ручной ВЫКЛ · " + fmtLeft(d.lleft);
+  s += '<div class="k" style="margin-top:6px">' + sub + "</div>";
+  return s;
+}
+async function postCmd(url, state, name, confirmMsg) {
+  if (confirmMsg && state === "on" && !confirm(confirmMsg)) return;
   try {
-    const r = await fetch("/pump", {
+    const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "state=" + encodeURIComponent(state) + "&token=" + encodeURIComponent(TOKEN)
@@ -75,9 +91,11 @@ async function setPump(state) {
     if (!r.ok) throw new Error(r.status + " " + (await r.text()));
     await tick();
   } catch (e) {
-    $("st").textContent = "помпа: " + e.message + " — обновите страницу";
+    $("st").textContent = name + ": " + e.message + " — обновите страницу";
   }
 }
+const setPump = s => postCmd("/pump", s, "помпа", "Включить помпу вручную на 60 секунд?");
+const setLamp = s => postCmd("/lamp", s, "подсветка", "Включить подсветку вручную на 1 час?");
 async function tick() {
   try {
     const r = await fetch("/api", { cache: "no-store" });
@@ -91,8 +109,11 @@ async function tick() {
       ? d.soil + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" + d.mv + " мВ</div>"
       : '<span class="err">датчик</span>';
     $("l").innerHTML = d.light + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" +
-                       d.light_mv + " мВ</div>";
+                       d.light_mv + " мВ · " +
+                       (d.lamp ? '<span class="on">лампа ВКЛ</span>'
+                               : '<span class="off">лампа выкл</span>') + "</div>";
     $("p").innerHTML = pumpHtml(d);
+    $("lamp").innerHTML = lampHtml(d);
     $("tm").textContent = d.time;
     $("dt").textContent = d.date + " " + d.wd;
     $("st").textContent = "IP " + d.ip + " · RSSI " + d.rssi + " dBm · работает " + fmtUp(d.up);
