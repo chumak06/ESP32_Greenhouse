@@ -127,6 +127,22 @@ constexpr uint8_t  LIGHT_SAMPLES   = 5;     // отсчётов на замер 
 constexpr int LIGHT_LAMP_ON_PCT  = 30;   // темнее — включаем подсветку
 constexpr int LIGHT_LAMP_OFF_PCT = 40;   // светлее — выключаем
 
+// Диагностика линии датчика света. У этого модуля шкала обратная: в темноте
+// около 3000 мВ, на ярком свете около 200 мВ. Оборванный провод или снятый
+// модуль дают почти 0 мВ, что без проверки читалось бы как «100 %, светло»,
+// и лампа не включилась бы в темноте. Порог намеренно ниже самого яркого
+// ожидаемого значения, чтобы яркий свет не считался аварией; верхнюю границу
+// не проверяем — КЗ на 3.3 В не отличить от темноты (там тоже ~3000 мВ).
+constexpr uint16_t LIGHT_FAULT_MV_LOW     = 50;   // ниже — обрыв/нет модуля
+constexpr uint8_t  LIGHT_FAULT_LOCK_AFTER = 3;    // 3 замера подряд = 15 с
+
+// Минимальное удержание состояния реле подсветки в авторежиме. Гистерезис
+// 30/40 % спасает от дребезга на границе, но не от того, что лента сама
+// освещает датчик: тогда «темно» и «светло» чередуются каждые 5 с. Пять минут
+// ограничивают такие переключения и берегут реле. Кардинальное решение —
+// экранировать датчик от ленты (см. README).
+constexpr uint32_t LAMP_MIN_STATE_MS = 5UL * 60UL * 1000UL;
+
 // Ручное управление подсветкой из веб-интерфейса — та же идея, что у помпы:
 // забытая кнопка не должна держать ленту включённой вечно (вода не потопит,
 // но лампа в теплице ночью не нужна). ВКЛ — принудительно на 1 час, ВЫКЛ —
@@ -251,6 +267,7 @@ PumpMode pumpMode = PumpMode::AUTO;
 
 LampMode lampMode = LampMode::AUTO;
 uint32_t lampManualEndsAt = 0;
+uint32_t lampStateChangedAt = 0;   // когда реле подсветки последний раз меняло состояние
 
 WaterState waterState    = WaterState::IDLE;
 uint8_t    waterCycle    = 0;                              // циклов в текущей сессии
@@ -263,7 +280,8 @@ uint16_t soilMv      = 0;
 int      soilPercent = 0;
 uint16_t lightMv      = 0;
 int      lightPercent = 0;
-uint8_t  soilFaultCount = 0;   // подряд ошибочных чтений почвы
+uint8_t  soilFaultCount  = 0;  // подряд ошибочных чтений почвы
+uint8_t  lightFaultCount = 0;  // подряд ошибочных чтений света
 DateTime clockNow;
 
 bool airOk       = false;
@@ -272,7 +290,7 @@ bool rtcOk       = false;
 bool clockOk     = false;
 bool pumpOn      = false;
 bool lampOn      = false;
-bool lightValid  = false;      // было хотя бы одно чтение — можно управлять лампой
+bool lightOk     = false;      // последний замер света достоверен
 bool netUp       = false;
 bool mdnsStarted = false;
 bool screenDirty = false;
@@ -555,6 +573,12 @@ void render() {
     }
 
     case View::LIGHT: {
+      if (!lightOk) {
+        snprintf(row0, sizeof(row0), "Light sensor err");
+        snprintf(row1, sizeof(row1), "check GPIO34");
+        break;
+      }
+
       snprintf(row0, sizeof(row0), "Light: %3d %%", lightPercent);
 
       // MAN — ручной ВКЛ, HOLD — ручной ВЫКЛ, LAMP — горит по автоматике.
@@ -652,6 +676,7 @@ void lampSet(bool on) {
   if (on == lampOn) return;
   lampOn = on;
   digitalWrite(LAMP_PIN, on ? LAMP_ON_LEVEL : !LAMP_ON_LEVEL);
+  lampStateChangedAt = millis();
   screenDirty = true;
 }
 
@@ -687,6 +712,9 @@ void lampManualOff(uint32_t now) {
 void lampAuto() {
   if (lampMode == LampMode::AUTO) return;
   lampMode = LampMode::AUTO;
+  // Ручной режим закончился — автоматика вправе решить сразу, не выжидая
+  // LAMP_MIN_STATE_MS после последнего ручного переключения.
+  lampStateChangedAt = millis() - LAMP_MIN_STATE_MS;
   // К ближайшему проходу loop() гистерезис приведёт ленту к состоянию по датчику.
   Serial.println("Lamp: AUTO");
 }
@@ -712,7 +740,11 @@ void updateLamp(uint32_t now) {
     return;
   }
 
-  if (!lightValid) return;                 // данных ещё нет — не гадаем
+  if (!lightOk) return;                    // датчик неисправен — не гадаем
+
+  // Реле не чаще раза в LAMP_MIN_STATE_MS: защита от автоколебаний, когда
+  // лента освещает собственный датчик и «светло/темно» меняются каждые 5 с.
+  if ((int32_t)(now - lampStateChangedAt) < (int32_t)LAMP_MIN_STATE_MS) return;
 
   if (!lampOn && lightPercent < LIGHT_LAMP_ON_PCT) {
     lampSet(true);
@@ -735,9 +767,33 @@ uint16_t readLightMv() {
 }
 
 void readLight() {
-  lightMv      = readLightMv();
+  const uint16_t mv = readLightMv();
+
+  // Почти ноль у этого модуля не встречается: в темноте ~3000 мВ, на ярком
+  // свете ~200 мВ. Значит, это обрыв провода или снятый модуль. Последнее
+  // хорошее значение не затираем, чтобы /api и экран не показывали ложные
+  // 100 %; после серии таких замеров помечаем датчик неисправным.
+  if (mv < LIGHT_FAULT_MV_LOW) {
+    if (lightFaultCount < 255) ++lightFaultCount;
+    if (lightFaultCount == LIGHT_FAULT_LOCK_AFTER) {
+      lightOk     = false;
+      screenDirty = true;
+      Serial.printf("Light: sensor fault (%u mV, %u in a row)\n",
+                    mv, lightFaultCount);
+    }
+    return;
+  }
+
+  if (!lightOk && lightFaultCount >= LIGHT_FAULT_LOCK_AFTER) {
+    // Логируем только восстановление после аварии, а не самый первый замер
+    // при старте (там lightOk ещё false, но отказа не было).
+    Serial.printf("Light: sensor OK (%u mV)\n", mv);
+  }
+  lightOk = true;
+  lightFaultCount = 0;
+
+  lightMv      = mv;
   lightPercent = constrain(map(lightMv, LIGHT_DARK_MV, LIGHT_BRIGHT_MV, 0, 100), 0, 100);
-  lightValid   = true;
   screenDirty  = true;
 
   if (view == View::LIGHT) {
@@ -839,7 +895,7 @@ void handleApi() {
   char json[640];
   snprintf(json, sizeof(json),
            "{\"t\":%.1f,\"t_ok\":%s,\"h\":%.1f,\"soil\":%d,\"mv\":%u,"
-           "\"light\":%d,\"light_mv\":%u,"
+           "\"light\":%d,\"light_mv\":%u,\"light_ok\":%s,"
            "\"soil_ok\":%s,\"pump\":%s,\"lamp\":%s,\"mode\":\"%s\",\"left\":%lu,"
            "\"lm\":\"%s\",\"lleft\":%lu,"
            "\"ws\":\"%s\",\"cyc\":%u,\"wleft\":%lu,"
@@ -852,6 +908,7 @@ void handleApi() {
            (unsigned)soilMv,
            lightPercent,
            (unsigned)lightMv,
+           lightOk ? "true" : "false",
            soilOk ? "true" : "false",
            pumpOn ? "true" : "false",
            lampOn ? "true" : "false",
@@ -1000,6 +1057,10 @@ void setup() {
   pinMode(LAMP_PIN, OUTPUT);
   digitalWrite(LAMP_PIN, !LAMP_ON_LEVEL);
   lampOn = false;
+
+  // Реле уже в известном состоянии; считаем, что изменено давно, иначе
+  // первое авто-включение ждало бы LAMP_MIN_STATE_MS после старта.
+  lampStateChangedAt = millis() - LAMP_MIN_STATE_MS;
 
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);

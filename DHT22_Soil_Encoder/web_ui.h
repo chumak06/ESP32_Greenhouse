@@ -108,10 +108,12 @@ async function tick() {
     $("s").innerHTML = d.soil_ok
       ? d.soil + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" + d.mv + " мВ</div>"
       : '<span class="err">датчик</span>';
-    $("l").innerHTML = d.light + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" +
-                       d.light_mv + " мВ · " +
-                       (d.lamp ? '<span class="on">лампа ВКЛ</span>'
-                               : '<span class="off">лампа выкл</span>') + "</div>";
+    $("l").innerHTML = d.light_ok
+      ? d.light + "<small> %</small><div class=\"k\" style=\"margin-top:6px\">" +
+        d.light_mv + " мВ · " +
+        (d.lamp ? '<span class="on">лампа ВКЛ</span>'
+                : '<span class="off">лампа выкл</span>') + "</div>"
+      : '<span class="err">датчик</span>';
     $("p").innerHTML = pumpHtml(d);
     $("lamp").innerHTML = lampHtml(d);
     $("tm").textContent = d.time;
